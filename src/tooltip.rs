@@ -72,7 +72,7 @@ pub fn render_tooltip(
     anchor_pos: egui::Pos2,
     name: &str,
     value: &PlotPoint,
-    x_axis_label: &str,
+    x_unit: &str,
     x_proportion: f64,
     is_log_scale: bool,
     y_unit: &str,
@@ -87,7 +87,6 @@ pub fn render_tooltip(
         String::new()
     };
 
-    let x_unit = extract_x_unit(x_axis_label);
     let x_parts = format_x_parts(value.x, x_proportion, x_unit);
     let y_parts = format_y_parts(value.y, is_log_scale, y_unit);
 
@@ -147,25 +146,29 @@ pub fn render_tooltip(
     painter.galley(pos, galley, text_color);
 }
 
-/// Extract unit from axis label parentheses, e.g. "Time (min)" -> "min"
-fn extract_x_unit(label: &str) -> &str {
-    if let Some(start) = label.rfind('(') {
-        if let Some(end) = label[start..].find(')') {
-            return &label[start + 1..start + end];
-        }
-    }
-    ""
-}
-
 /// Format X value as parts with bold flag: Vec<(text, is_bold)>
 fn format_x_parts(x: f64, x_proportion: f64, unit: &str) -> Vec<(String, bool)> {
     let (sign, abs_x) = if x < 0.0 { ("-", -x) } else { ("", x) };
 
+    let is_day = matches!(unit, "d" | "day" | "days");
     let is_minute = matches!(unit, "min" | "minute" | "minutes");
     let is_hour = matches!(unit, "h" | "hour" | "hours");
     let is_second = matches!(unit, "s" | "sec" | "second" | "seconds");
 
-    if (x_proportion - 1.0 / 60.0).abs() < 1e-6 && is_minute {
+    if (x_proportion - 1.0 / 86400.0).abs() < 1e-6 && is_day {
+        let whole_days = abs_x.floor() as i64;
+        let remaining_h = (abs_x - whole_days as f64) * 24.0;
+        let whole_hours = remaining_h.floor() as i64;
+        let remaining_m = (remaining_h - whole_hours as f64) * 60.0;
+        let whole_min = remaining_m.floor() as i64;
+        let seconds = (remaining_m - whole_min as f64) * 60.0;
+        let sec_int = seconds.round() as i64;
+        vec![
+            (format!("t = {}", sign), false),
+            (format!("{}", whole_days), true),
+            (format!("d {:02}:{:02}:{:02}", whole_hours, whole_min, sec_int), false),
+        ]
+    } else if (x_proportion - 1.0 / 60.0).abs() < 1e-6 && is_minute {
         let whole_min = abs_x.floor() as i64;
         let seconds = (abs_x - whole_min as f64) * 60.0;
         let sec_1dec = (seconds * 10.0).round() / 10.0;

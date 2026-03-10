@@ -261,8 +261,16 @@ pub struct Cli {
     repaint_interval_ms: u64,
 
     /// X-axis label
-    #[arg(long, default_value = "Time (min)")]
+    #[arg(long, default_value = "Time")]
     x_axis_label: String,
+
+    /// X-axis unit
+    #[arg(long, default_value = "min")]
+    x_unit: String,
+
+    /// X-axis time scale: d, h, m, s (overrides --x-proportion)
+    #[arg(long)]
+    x_time_scale: Option<String>,
 
     /// X-value proportional constant (multiplied to raw X)
     #[arg(long, default_value_t = 0.0166666666666667)]
@@ -336,7 +344,9 @@ fn help_text() -> String {
         --fixed-width <N,N,...>  Fixed-width columns (overrides delimiter)\n\n\
         Rendering:\n\
         --repaint-interval-ms <N>  Repaint interval [default: 250]\n\
-        --x-axis-label <STR>       X-axis label [default: Time (min)]\n\
+        --x-axis-label <STR>       X-axis label [default: Time]\n\
+        --x-unit <UNIT>            X-axis unit [default: min]\n\
+        --x-time-scale <NAME>      Time scale: d,h,m,s (overrides --x-proportion)\n\
         --x-proportion <F>         X proportional constant [default: 1/60]\n\
         --line-width <F>           Line width [default: 1.5]\n\
         --colors <#RRGGBB,...>     Series colors (empty=default 12)\n\
@@ -477,6 +487,18 @@ fn main() -> eframe::Result {
             }
         }
     };
+
+    // Resolve x_time_scale → x_proportion
+    let mut cli = cli;
+    if let Some(ref scale) = cli.x_time_scale {
+        cli.x_proportion = match scale.as_str() {
+            "d" => 1.0 / 86400.0,
+            "h" => 1.0 / 3600.0,
+            "m" => 1.0 / 60.0,
+            "s" => 1.0,
+            _ => cli.x_proportion,
+        };
+    }
 
     let csv_filename = cli
         .csv_path

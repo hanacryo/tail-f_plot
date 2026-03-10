@@ -23,6 +23,7 @@ pub struct PlotApp {
     y_unit: String,
     repaint_interval_ms: u64,
     x_axis_label: String,
+    x_unit: String,
     line_width: f32,
     colors: Vec<[u8; 3]>,
     max_points: usize,
@@ -82,7 +83,12 @@ impl PlotApp {
             toolbar,
             y_unit: cli.y_unit,
             repaint_interval_ms: cli.repaint_interval_ms,
-            x_axis_label: cli.x_axis_label,
+            x_axis_label: if cli.x_unit.is_empty() {
+                cli.x_axis_label.clone()
+            } else {
+                format!("{} ({})", cli.x_axis_label, cli.x_unit)
+            },
+            x_unit: cli.x_unit,
             line_width: cli.line_width,
             colors,
             max_points: cli.max_points,
@@ -414,7 +420,7 @@ impl eframe::App for PlotApp {
                         anchor,
                         name,
                         &value,
-                        &self.x_axis_label,
+                        &self.x_unit,
                         self.x_proportion,
                         is_log_scale,
                         &self.y_unit,

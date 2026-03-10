@@ -98,7 +98,9 @@ tail-f_plot.exe [OPTIONS] <CSV_PATH>
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--repaint-interval-ms <N>` | `250` | Poll/repaint interval in milliseconds |
-| `--x-axis-label <STR>` | `Time (min)` | X-axis label text |
+| `--x-axis-label <STR>` | `Time` | X-axis label text |
+| `--x-unit <UNIT>` | `min` | X-axis unit (shown in axis label and tooltip) |
+| `--x-time-scale <NAME>` | | Time scale: `d`, `h`, `m`, `s` (overrides `--x-proportion`) |
 | `--x-proportion <F>` | `0.01667` (1/60) | Multiplier applied to raw X values |
 | `--line-width <F>` | `1.5` | Line stroke width |
 | `--colors <#RRGGBB,...>` | 12 defaults | Series colors (empty = built-in palette) |

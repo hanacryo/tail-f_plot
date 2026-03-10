@@ -3,8 +3,10 @@
 
 mod app;
 mod csv_watcher;
+mod custom_legend;
 mod plot_state;
 mod toolbar;
+mod tooltip;
 
 use clap::Parser;
 use eframe::egui;
@@ -14,39 +16,169 @@ use std::sync::Arc;
 /// Try to attach to parent console on Windows. Returns true (CLI) or false (double-click).
 #[cfg(windows)]
 fn try_attach_console() -> bool {
-    use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
-    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) != 0 }
+    // Debug builds lack windows_subsystem="windows", so a console is auto-allocated.
+    // AttachConsole fails when a console already exists, so just return true.
+    #[cfg(debug_assertions)]
+    { return true; }
+    #[cfg(not(debug_assertions))]
+    {
+        use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+        unsafe { AttachConsole(ATTACH_PARENT_PROCESS) != 0 }
+    }
 }
 
 #[cfg(not(windows))]
 fn try_attach_console() -> bool { true }
 
-/// Show a Windows MessageBox
-#[cfg(windows)]
-fn show_message_box(title: &str, message: &str) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_OK, MB_ICONINFORMATION};
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
+/// Register OS fonts as primary, with egui defaults as fallback.
+pub fn register_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
 
-    fn to_wide(s: &str) -> Vec<u16> {
-        OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    // Load OS fonts
+    let mut load = |key: &str, path: &str| -> bool {
+        if let Ok(data) = std::fs::read(path) {
+            fonts.font_data.insert(key.into(), egui::FontData::from_owned(data).into());
+            true
+        } else {
+            false
+        }
+    };
+    let has_segoe  = load("segoe_ui", "C:\\Windows\\Fonts\\segoeui.ttf");
+    let has_bold   = load("segoe_bold", "C:\\Windows\\Fonts\\segoeuib.ttf");
+    let has_mono   = load("consolas", "C:\\Windows\\Fonts\\consola.ttf");
+    let has_symbol = load("segoe_symbol", "C:\\Windows\\Fonts\\seguisym.ttf");
+
+    // Prepend OS font to Proportional (Segoe UI → Segoe UI Symbol → egui defaults)
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        if has_symbol { family.insert(0, "segoe_symbol".into()); }
+        if has_segoe  { family.insert(0, "segoe_ui".into()); }
     }
 
-    let title_wide = to_wide(title);
-    let message_wide = to_wide(message);
+    // Prepend OS font to Monospace (Consolas → egui defaults as fallback)
+    if has_mono {
+        if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+            family.insert(0, "consolas".into());
+        }
+    }
 
-    unsafe {
-        MessageBoxW(
-            std::ptr::null_mut(),
-            message_wide.as_ptr(),
-            title_wide.as_ptr(),
-            MB_OK | MB_ICONINFORMATION,
-        );
+    // Bold family: Segoe UI Bold + Proportional fallback
+    let proportional_names = fonts
+        .families
+        .get(&egui::FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    let bold_family = fonts
+        .families
+        .entry(egui::FontFamily::Name("Bold".into()))
+        .or_default();
+    if has_bold {
+        bold_family.push("segoe_bold".into());
+    }
+    for name in proportional_names {
+        bold_family.push(name);
+    }
+
+    ctx.set_fonts(fonts);
+}
+
+/// Render About modal dialog (shared between PlotApp and HelpApp)
+pub fn render_about_modal(ctx: &egui::Context, show: &mut bool) {
+    use egui::text::LayoutJob;
+    use egui::{FontFamily, FontId, TextFormat};
+
+    let modal = egui::containers::Modal::new(egui::Id::new("about_modal")).show(ctx, |ui| {
+        ui.vertical_centered(|ui| {
+            let mut job = LayoutJob::default();
+            job.append(
+                "HANA tail-f_plot",
+                0.0,
+                TextFormat {
+                    font_id: FontId::new(16.0, FontFamily::Name("Bold".into())),
+                    ..Default::default()
+                },
+            );
+            job.append(
+                &format!(" v{}", env!("FULL_VERSION")),
+                0.0,
+                TextFormat {
+                    font_id: FontId::new(14.0, FontFamily::Proportional),
+                    ..Default::default()
+                },
+            );
+            ui.label(job);
+
+            ui.add_space(8.0);
+            ui.label("Real-time CSV/TSV plotting tool (tail -f with a graph)");
+            ui.add_space(4.0);
+            ui.label("Copyright \u{24d2}2026 HANA");
+            ui.add_space(4.0);
+            ui.hyperlink("https://github.com/hanacryo/tail-f_plot");
+            ui.add_space(12.0);
+
+            let btn = egui::Button::new("OK").min_size(egui::vec2(80.0, 28.0));
+            if ui.add(btn).clicked() {
+                *show = false;
+            }
+        });
+    });
+
+    if modal.should_close() {
+        *show = false;
     }
 }
 
-#[cfg(not(windows))]
-fn show_message_box(_title: &str, _message: &str) {}
+/// HelpApp: eframe app for displaying help text when launched without arguments (double-click)
+struct HelpApp {
+    help_text: String,
+    show_about: bool,
+}
+
+impl eframe::App for HelpApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::TopBottomPanel::bottom("help_buttons").show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let btn_size = egui::vec2(80.0, 28.0);
+                if ui.add(egui::Button::new("About").min_size(btn_size)).clicked() {
+                    self.show_about = true;
+                }
+                if ui.add(egui::Button::new("OK").min_size(btn_size)).clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+            ui.add_space(4.0);
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::both().show(ui, |ui| {
+                let mut text = self.help_text.clone();
+                ui.add(
+                    egui::TextEdit::multiline(&mut text)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(30),
+                );
+            });
+        });
+
+        if self.show_about {
+            render_about_modal(ctx, &mut self.show_about);
+        }
+    }
+}
+
+/// Show help text in an eframe window (used when double-clicking the exe)
+fn show_help_window(help_text: String) {
+    let viewport = egui::ViewportBuilder::default()
+        .with_title("tail-f_plot Usage")
+        .with_inner_size([700.0, 520.0])
+        .with_icon(Arc::new(load_icon()));
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    eframe::run_native("tail-f_plot Usage", options, Box::new(move |cc| {
+        register_fonts(&cc.egui_ctx);
+        Ok(Box::new(HelpApp { help_text, show_about: false }))
+    })).ok();
+}
 
 /// Load icon data from embedded PNG
 fn load_icon() -> egui::IconData {
@@ -318,10 +450,11 @@ fn main() -> eframe::Result {
                 let has_console = try_attach_console();
                 if has_console {
                     eprintln!("{}", help_text());
+                    std::process::exit(if cli.help { 0 } else { 1 });
                 } else {
-                    show_message_box("tail-f_plot Usage", &help_text());
+                    show_help_window(help_text());
+                    std::process::exit(if cli.help { 0 } else { 1 });
                 }
-                std::process::exit(if cli.help { 0 } else { 1 });
             }
             cli
         }
@@ -337,10 +470,11 @@ fn main() -> eframe::Result {
             let has_console = try_attach_console();
             if has_console {
                 eprintln!("{}", help_text());
+                std::process::exit(1);
             } else {
-                show_message_box("tail-f_plot Usage", &help_text());
+                show_help_window(help_text());
+                std::process::exit(1);
             }
-            std::process::exit(1);
         }
     };
 

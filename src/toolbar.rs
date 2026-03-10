@@ -11,6 +11,7 @@ pub struct ToolbarState {
     pub need_reset: bool,       // plot internal memory reset needed (on auto toggle)
     pub log_scale: bool,        // manual log scale toggle
     pub legend_pos: Corner,     // legend position (4 corners)
+    pub show_about: bool,       // About modal display flag
     prev_log_scale: bool,       // previous frame log scale state (for change detection)
     prev_auto_x: bool,          // previous frame auto_x state (for toggle detection)
     prev_auto_y: bool,          // previous frame auto_y state (for toggle detection)
@@ -26,6 +27,7 @@ impl Default for ToolbarState {
             need_reset: false,
             log_scale: false,
             legend_pos: Corner::LeftBottom, // default: bottom-left
+            show_about: false,
             prev_log_scale: false,
             prev_auto_x: true,
             prev_auto_y: true,
@@ -94,6 +96,13 @@ impl ToolbarState {
                     Corner::RightBottom => Corner::LeftBottom,
                 };
             }
+
+            // About button at right end
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("About").clicked() {
+                    self.show_about = true;
+                }
+            });
         });
 
         // Detect log scale change -> trigger Home

@@ -6,8 +6,8 @@ license = "MIT"
 description = "Real-time CSV/TSV plotting tool (tail -f with a graph)"
 
 [dependencies]
-eframe = "0.29"
-egui_plot = "0.29"
+eframe = "0.33"
+egui_plot = "0.34"
 clap = { version = "4", features = ["derive"] }
 notify = "7"
 

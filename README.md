@@ -18,32 +18,28 @@ Built with [egui](https://github.com/emilk/egui) and [egui_plot](https://github.
 
 ## Installation
 
+### MSI Installer
+
+Download the latest `.msi` from [Releases](../../releases). No admin rights needed.
+
+- Installs to `%LOCALAPPDATA%\HANA\tail-f_plot\`
+- Adds to user PATH automatically
+- Start Menu shortcut in `HANA-Cryogenics`
+- Uninstall via Windows Settings > Apps
+
+### Portable
+
+Download `tail-f_plot.exe` from [Releases](../../releases) and place it anywhere.
+
 ### From source
 
-```bash
+```
 cargo build --release
 ```
 
-The binary is at `target/release/tail-f_plot.exe`.
-
-#### Using `build.sh`
-
-`build.sh` wraps `cargo build --release` with automatic build-number management.
-Each run increments the build number in `VERSION.txt` (e.g. `0.1.2.10043` -> `0.1.2.10044`) and embeds the full version string into the binary (PE resources, `--version` output).
-
-```bash
-# Build and leave the binary in target/release/
-bash build.sh
-
-# Build and copy to a dist directory
-DIST_DIR=./dist bash build.sh
-```
-
-If you only need a quick build without version tracking, plain `cargo build --release` works fine.
-
 ## Quick Start
 
-```bash
+```
 # Basic: plot column 2 over column 1
 tail-f_plot.exe data.csv --y-cols 2
 

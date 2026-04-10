@@ -1,5 +1,7 @@
-// Hide CMD console window in release builds
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Use console subsystem so that stdout/stderr works in all terminals
+// (cmd, PowerShell, Git Bash / mintty).  For double-click launches a
+// transient console window is hidden immediately — see `hide_own_console()`.
+// #![windows_subsystem = "console"]  ← implicit default; kept as a comment for clarity.
 
 mod app;
 mod csv_watcher;
@@ -13,22 +15,30 @@ use eframe::egui;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Try to attach to parent console on Windows. Returns true (CLI) or false (double-click).
+/// If this process owns its console (double-click launch), hide the console window
+/// immediately and return `true`.  When launched from a terminal (cmd / PowerShell /
+/// Git Bash), the console belongs to the shell so we leave it alone and return `false`.
 #[cfg(windows)]
-fn try_attach_console() -> bool {
-    // Debug builds lack windows_subsystem="windows", so a console is auto-allocated.
-    // AttachConsole fails when a console already exists, so just return true.
-    #[cfg(debug_assertions)]
-    { return true; }
-    #[cfg(not(debug_assertions))]
-    {
-        use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
-        unsafe { AttachConsole(ATTACH_PARENT_PROCESS) != 0 }
+fn hide_own_console() -> bool {
+    use windows_sys::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    unsafe {
+        let mut pids = [0u32; 4];
+        let count = GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32);
+        if count <= 1 {
+            // Only this process uses the console → we allocated it (double-click).
+            let wnd = GetConsoleWindow();
+            if !wnd.is_null() {
+                ShowWindow(wnd, SW_HIDE);
+            }
+            return true;
+        }
+        false
     }
 }
 
 #[cfg(not(windows))]
-fn try_attach_console() -> bool { true }
+fn hide_own_console() -> bool { false }
 
 /// Register OS fonts as primary, with egui defaults as fallback.
 pub fn register_fonts(ctx: &egui::Context) {
@@ -445,6 +455,11 @@ fn get_monitor_work_area(index: u32) -> Option<(i32, i32, i32, i32, u32, f64)> {
 }
 
 fn main() -> eframe::Result {
+    // If launched by double-click, hide the auto-allocated console window immediately
+    // so it never visibly flashes.  CLI launches (cmd / PowerShell / Git Bash) are
+    // unaffected — their console belongs to the shell.
+    let owns_console = hide_own_console();
+
     // Set Per-Monitor DPI Aware v2 (must be called first for accurate physical coords/DPI)
     #[cfg(windows)]
     unsafe {
@@ -457,34 +472,29 @@ fn main() -> eframe::Result {
     let cli = match Cli::try_parse() {
         Ok(cli) => {
             if cli.help || cli.csv_path.is_none() {
-                let has_console = try_attach_console();
-                if has_console {
-                    eprintln!("{}", help_text());
-                    std::process::exit(if cli.help { 0 } else { 1 });
-                } else {
+                if owns_console {
                     show_help_window(help_text());
-                    std::process::exit(if cli.help { 0 } else { 1 });
+                } else {
+                    eprintln!("{}", help_text());
                 }
+                std::process::exit(if cli.help { 0 } else { 1 });
             }
             cli
         }
         Err(e) => {
             // --version: clap 기본 동작 유지
             if e.kind() == clap::error::ErrorKind::DisplayVersion {
-                let has_console = try_attach_console();
-                if has_console {
+                if !owns_console {
                     eprintln!("{}", e);
                 }
                 std::process::exit(0);
             }
-            let has_console = try_attach_console();
-            if has_console {
-                eprintln!("{}", help_text());
-                std::process::exit(1);
-            } else {
+            if owns_console {
                 show_help_window(help_text());
-                std::process::exit(1);
+            } else {
+                eprintln!("{}", help_text());
             }
+            std::process::exit(1);
         }
     };
 
@@ -569,6 +579,13 @@ fn main() -> eframe::Result {
         viewport,
         ..Default::default()
     };
+
+    // Free the hidden console before launching the GUI (double-click case).
+    // For CLI launches this is a no-op since we don't own the console.
+    if owns_console {
+        #[cfg(windows)]
+        unsafe { windows_sys::Win32::System::Console::FreeConsole(); }
+    }
 
     let title_for_app = title.clone();
     eframe::run_native(

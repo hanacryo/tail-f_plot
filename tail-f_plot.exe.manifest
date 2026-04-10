@@ -4,7 +4,7 @@
     type="win32"
     name="com.hana.tail-f-plot"
     version="%%VERSION%%"
-    processorArchitecture="amd64"/>
+    processorArchitecture="%%ARCH%%"/>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>

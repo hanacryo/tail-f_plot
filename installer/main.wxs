@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="HANA tail-f_plot"
+           Version="$(var.Version)"
+           Manufacturer="HANA"
+           UpgradeCode="d8f4a2e1-3b7c-4d5f-a9e6-2c1b4f8a5d3e"
+           Scope="perUser">
+
+    <SummaryInformation Description="Real-time CSV/TSV plotting tool (tail -f with a graph)" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Install: %LOCALAPPDATA%\HANA\tail-f_plot\ -->
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="INSTALLFOLDER" Name="HANA">
+        <Directory Id="APPFOLDER" Name="tail-f_plot">
+          <Component Id="MainExe" Guid="*">
+            <File Id="MainExeFile" Source="$(var.ExePath)" KeyPath="yes" />
+            <Environment Id="PATH" Name="PATH" Value="[APPFOLDER]"
+                         Permanent="no" Part="last" Action="set" System="no" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <!-- Start Menu: HANA-Cryogenics\tail-f_plot -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="HanaMenuFolder" Name="HANA-Cryogenics">
+        <Component Id="StartMenuShortcut" Guid="*">
+          <Shortcut Id="AppShortcut"
+                    Name="tail-f_plot"
+                    Target="[APPFOLDER]tail-f_plot.exe"
+                    WorkingDirectory="APPFOLDER"
+                    Description="Real-time CSV/TSV plotting tool" />
+          <RegistryValue Root="HKCU" Key="Software\HANA\tail-f_plot"
+                         Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+          <RemoveFolder Id="RemoveHanaMenuFolder" Directory="HanaMenuFolder" On="uninstall" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="tail-f_plot" Level="1">
+      <ComponentRef Id="MainExe" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Package>
+</Wix>

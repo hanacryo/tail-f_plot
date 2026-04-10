@@ -1,5 +1,7 @@
-# Build outputs
+# Build
 /target/
+/dist/
+.last_build_hash
 
 # IDE
 .vs/
@@ -11,7 +13,7 @@
 .DS_Store
 Thumbs.db
 
-# Logs & temp
+# Temp
 *.log
 *.tmp
 *.swp

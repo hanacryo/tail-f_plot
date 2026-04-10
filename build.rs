@@ -54,10 +54,15 @@ fn main() {
         let manifest_path = Path::new(&crate_dir).join("tail-f_plot.exe.manifest");
         let manifest = fs::read_to_string(&manifest_path)
             .expect("Failed to read tail-f_plot.exe.manifest");
-        let manifest = manifest.replace(
-            "%%VERSION%%",
-            &format!("{}.{}.{}.0", major, minor, patch),
-        );
+        let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "x86_64".into());
+        let proc_arch = match arch.as_str() {
+            "aarch64" => "arm64",
+            "x86" => "x86",
+            _ => "amd64",
+        };
+        let manifest = manifest
+            .replace("%%VERSION%%", &format!("{}.{}.{}.0", major, minor, patch))
+            .replace("%%ARCH%%", proc_arch);
         res.set_manifest(&manifest);
 
         if let Err(e) = res.compile() {

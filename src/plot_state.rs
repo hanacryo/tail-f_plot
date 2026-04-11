@@ -90,7 +90,8 @@ impl PlotData {
 
     /// Compute X/Y bounds across all series. Only valid values included.
     /// Returns None if no data.
-    pub fn get_bounds(&self) -> Option<(f64, f64, f64, f64)> {
+    /// Unused for now, but may be useful for auto-scaling in the future.
+    pub fn _get_bounds(&self) -> Option<(f64, f64, f64, f64)> {
         let mut x_min = f64::MAX;
         let mut x_max = f64::MIN;
         let mut y_min = f64::MAX;

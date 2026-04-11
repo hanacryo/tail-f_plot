@@ -15,14 +15,23 @@ use eframe::egui;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// If this process owns its console (double-click launch), hide the console window
-/// immediately and return `true`.  When launched from a terminal (cmd / PowerShell /
-/// Git Bash), the console belongs to the shell so we leave it alone and return `false`.
+/// If this process owns its console (double-click launch) AND stdout is not piped,
+/// hide the console window immediately and return `true`.
+/// When launched from a terminal or when stdout is redirected/piped by a parent
+/// process, return `false` so output goes to stdout instead of a GUI window.
 #[cfg(windows)]
 fn hide_own_console() -> bool {
     use windows_sys::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
     use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE};
+    use windows_sys::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_PIPE};
     unsafe {
+        // If stdout is a pipe, a parent process is capturing our output — stay in CLI mode.
+        let stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if GetFileType(stdout_handle) == FILE_TYPE_PIPE {
+            return false;
+        }
+
         let mut pids = [0u32; 4];
         let count = GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32);
         if count <= 1 {
@@ -328,12 +337,19 @@ pub fn resolve_string_quote(name: &str) -> Option<char> {
     }
 }
 
+fn exe_name() -> String {
+    std::env::current_exe()
+        .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
+        .unwrap_or_else(|_| env!("CARGO_PKG_NAME").to_string())
+}
+
 fn help_text() -> String {
+    let exe = exe_name();
     format!(
         "HANA tail-f_plot v{ver}\n\n\
         Real-time CSV plotting tool.\n\n\
         Usage:\n\
-        tail-f_plot.exe [OPTIONS] <CSV_PATH>\n\n\
+        {exe} <CSV_PATH> [OPTIONS]\n\n\
         Arguments:\n\
         <CSV_PATH>  CSV file path\n\n\
         Options:\n\
@@ -362,11 +378,13 @@ fn help_text() -> String {
         --colors <#RRGGBB,...>     Series colors (empty=default 12)\n\
         --max-points <N>           Max points per series [default: 5000]\n\
         --max-x-range <F>          Max X range [default: 120.0]\n\
+          (max-points / max-x-range: stricter of the two applies)\n\
         --marker-radius <F>        Marker radius [default: 4.0]\n\n\
         Example:\n\
-        tail-f_plot.exe data.csv --y-cols 2,3 --y-names \"Temp,Pressure\"\n\
-        tail-f_plot.exe data.tsv --delimiter tab --y-cols 2,3",
-        ver = env!("FULL_VERSION")
+        {exe} data.csv --y-cols 2,3 --y-names \"Temp,Pressure\"\n\
+        {exe} data.tsv --delimiter tab --y-cols 2,3",
+        ver = env!("FULL_VERSION"),
+        exe = exe
     )
 }
 
@@ -472,10 +490,11 @@ fn main() -> eframe::Result {
     let cli = match Cli::try_parse() {
         Ok(cli) => {
             if cli.help || cli.csv_path.is_none() {
+                let help = help_text();
                 if owns_console {
-                    show_help_window(help_text());
+                    show_help_window(help);
                 } else {
-                    eprintln!("{}", help_text());
+                    println!("{}", help);
                 }
                 std::process::exit(if cli.help { 0 } else { 1 });
             }
@@ -485,18 +504,32 @@ fn main() -> eframe::Result {
             // --version: clap 기본 동작 유지
             if e.kind() == clap::error::ErrorKind::DisplayVersion {
                 if !owns_console {
-                    eprintln!("{}", e);
+                    println!("{}", e);
                 }
                 std::process::exit(0);
             }
+            let help = help_text();
             if owns_console {
-                show_help_window(help_text());
+                show_help_window(help);
             } else {
-                eprintln!("{}", help_text());
+                let msg = e.to_string();
+                let filtered: String = msg.lines()
+                    .filter(|l| !l.starts_with("Usage:"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                println!("EXCEPTION: {}\n\nRun `{} --help` for usage.", filtered.trim(), exe_name());
             }
             std::process::exit(1);
         }
     };
+
+    println!("PID: {}", std::process::id());
+    let csv_path = cli.csv_path.as_ref().unwrap();
+    if csv_path.exists() {
+        println!("WATCHING: {}", csv_path.display());
+    } else {
+        println!("WAITING: {}", csv_path.display());
+    }
 
     // Resolve x_time_scale → x_proportion
     let mut cli = cli;
@@ -518,10 +551,11 @@ fn main() -> eframe::Result {
         .unwrap_or_default();
 
     let names_str = cli.y_names.join(",");
-    let title = format!(
-        "{} - {} - HANA tail-f_plot - v{}",
-        names_str, csv_filename, env!("FULL_VERSION")
-    );
+    let title = if names_str.is_empty() {
+        format!("{} - HANA tail-f_plot - v{}", csv_filename, env!("FULL_VERSION"))
+    } else {
+        format!("{} - {} - HANA tail-f_plot - v{}", names_str, csv_filename, env!("FULL_VERSION"))
+    };
 
     // Compute physical pixel placement when --bounds is specified (for SetWindowPos)
     let physical_placement: Option<[i32; 4]> = if cli.bounds.len() == 4 {

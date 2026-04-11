@@ -56,8 +56,54 @@ tail-f_plot.exe data.csv --y-cols 5 --log-y --monitor 1 --bounds 0,0,50,100
 ## Usage
 
 ```
-tail-f_plot.exe [OPTIONS] <CSV_PATH>
+tail-f_plot.exe <CSV_PATH> [OPTIONS]
 ```
+
+### Launching
+
+#### From the console
+
+`tail-f_plot` is a GUI app that does **not** release the console prompt on its own. Use `start` to launch it in the background:
+
+```cmd
+rem cmd
+start tail-f_plot.exe data.csv --y-cols 2,3
+```
+
+```powershell
+# PowerShell 5.1
+Start-Process .\tail-f_plot.exe -ArgumentList "data.csv","--y-cols","2,3"
+
+# PowerShell 7
+.\tail-f_plot.exe data.csv --y-cols 2,3 &
+# [PS7] Job objects persist after the app exits. Use `Get-Job` / `Remove-Job` to clean up.
+```
+
+```bash
+# Git Bash (stdout is printed to the terminal)
+./tail-f_plot.exe data.csv --y-cols 2,3 &
+```
+
+> **Note (v0.2.x):** In v0.1.x the process detached automatically. From v0.2.x onward `start` (or equivalent) is required to get the prompt back immediately.
+
+#### From another application
+
+If your app spawns `tail-f_plot` as a child process:
+
+- **Use a dedicated thread** (or async task) for the spawn call — the process stays alive as long as the GUI is open, so a synchronous wait will freeze your app.
+- Alternatively, use `start` / `DETACHED_PROCESS` if you don't need stdout.
+
+#### stdout status
+
+On successful launch, two lines are printed to stdout and then **no further output is produced** (release builds only; debug builds may emit diagnostics to stderr). Parse the **first line prefix** to determine the outcome:
+
+| First line prefix | Meaning | Exit code |
+|-------------------|---------|-----------|
+| `PID: ` | Launched successfully. Second line is `WATCHING: <path>` (file exists) or `WAITING: <path>` (file not yet created). | — |
+| `HANA ` | Help text displayed (no args, or `--help`). | 0 or 1 |
+| `EXCEPTION: ` | Invalid arguments. Error detail follows. | 1 |
+
+> `cmd start` and PowerShell `Start-Process` cannot capture stdout. Git Bash `&` is the only shell method that shows stdout while returning the prompt. To capture stdout programmatically, spawn the process directly with a pipe.
 
 ### Arguments
 
@@ -100,9 +146,11 @@ tail-f_plot.exe [OPTIONS] <CSV_PATH>
 | `--x-proportion <F>` | `0.01667` (1/60) | Multiplier applied to raw X values |
 | `--line-width <F>` | `1.5` | Line stroke width |
 | `--colors <#RRGGBB,...>` | 12 defaults | Series colors (empty = built-in palette) |
-| `--max-points <N>` | `5000` | Max rendered points per series |
-| `--max-x-range <F>` | `120.0` | Max visible X range (after proportion) |
+| `--max-points <N>` | `5000` | Max rendered points per series (see note below) |
+| `--max-x-range <F>` | `120.0` | Max visible X range after proportion (see note below) |
 | `--marker-radius <F>` | `4.0` | Data point marker radius |
+
+> **`--max-points` / `--max-x-range`:** Both limit the visible window. The stricter of the two applies.
 
 ## Keyboard & Mouse
 

@@ -116,7 +116,7 @@ impl eframe::App for PlotApp {
         }
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // First frame: Win32 SetWindowPos for precise physical coordinate placement
         if !self.placement_applied {
             self.placement_applied = true;
@@ -126,17 +126,18 @@ impl eframe::App for PlotApp {
         }
 
         self.watcher.poll(&mut self.data);
-        ctx.request_repaint_after(std::time::Duration::from_millis(self.repaint_interval_ms));
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(self.repaint_interval_ms));
 
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        egui::Panel::top("toolbar").show_inside(ui, |ui| {
             self.toolbar.ui(ui);
         });
 
         if self.toolbar.show_about {
-            crate::render_about_modal(ctx, &mut self.toolbar.show_about);
+            crate::render_about_modal(ui.ctx(), &mut self.toolbar.show_about);
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             let mode = self.toolbar.mode;
             let is_log_scale = self.toolbar.log_scale;
             let allow_drag = mode == PlotMode::None;
@@ -326,9 +327,13 @@ impl eframe::App for PlotApp {
             let plot_response = &response.response;
             let plot_hovered = plot_response.hovered();
 
-            // Detect user scroll-zoom via raw_scroll_delta (raw_input_hook injects ctrl)
-            let scroll_delta = ctx.input(|i| i.raw_scroll_delta);
-            let scrolled_on_plot = scroll_delta != egui::Vec2::ZERO && plot_hovered;
+            // Detect user scroll-zoom: raw_input_hook injects ctrl into MouseWheel
+            // events, so the wheel delta is consumed as zoom. Check for the raw
+            // MouseWheel event directly (egui 0.34 removed InputState::raw_scroll_delta).
+            let wheel_scrolled = ui
+                .ctx()
+                .input(|i| i.events.iter().any(|e| matches!(e, egui::Event::MouseWheel { .. })));
+            let scrolled_on_plot = wheel_scrolled && plot_hovered;
             let user_interacted =
                 plot_response.dragged() || plot_response.double_clicked() || scrolled_on_plot;
 
@@ -393,33 +398,21 @@ impl eframe::App for PlotApp {
             // --- Custom tooltip (manual hover detection, no built-in tooltip) ---
             if let Some(hover_pos) = plot_response.hover_pos() {
                 if frame_rect.contains(hover_pos) {
-                    let hover_result = crate::tooltip::find_closest_point(
+                    let hover = crate::tooltip::find_hover(
                         hover_pos,
                         &response.transform,
                         &self.data.series,
                         &self.series_visible,
+                        &self.colors,
                         render_range,
                         is_log_scale,
                         400.0, // 20px squared
                     );
-
-                    let (name, value, anchor) = if let Some(ref hr) = hover_result {
-                        (
-                            hr.name.as_str(),
-                            hr.value,
-                            response.transform.position_from_point(&hr.value),
-                        )
-                    } else {
-                        let value = response.transform.value_from_position(hover_pos);
-                        ("", value, hover_pos)
-                    };
-
+                    crate::tooltip::render_crosshair(ui, frame_rect, hover.anchor);
                     crate::tooltip::render_tooltip(
                         ui,
                         frame_rect,
-                        anchor,
-                        name,
-                        &value,
+                        &hover,
                         &self.x_unit,
                         self.x_proportion,
                         is_log_scale,

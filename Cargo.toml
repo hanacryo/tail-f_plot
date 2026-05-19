@@ -1,18 +1,19 @@
 [package]
 name = "tail-f_plot"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 license = "MIT"
 description = "Real-time CSV/TSV plotting tool (tail -f with a graph)"
 
 [dependencies]
-eframe = "0.33"
-egui_plot = "0.34"
+# eframe 0.34+ uses the wgpu renderer by default.
+eframe = "0.34"
+egui_plot = "0.35"
 clap = { version = "4", features = ["derive"] }
 notify = "7"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_System_Console",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",

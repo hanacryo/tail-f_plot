@@ -153,8 +153,8 @@ struct HelpApp {
 }
 
 impl eframe::App for HelpApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::TopBottomPanel::bottom("help_buttons").show(ctx, |ui| {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::Panel::bottom("help_buttons").show_inside(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let btn_size = egui::vec2(80.0, 28.0);
@@ -162,13 +162,13 @@ impl eframe::App for HelpApp {
                     self.show_about = true;
                 }
                 if ui.add(egui::Button::new("OK").min_size(btn_size)).clicked() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
             ui.add_space(4.0);
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             egui::ScrollArea::both().show(ui, |ui| {
                 let mut text = self.help_text.clone();
                 ui.add(
@@ -181,7 +181,7 @@ impl eframe::App for HelpApp {
         });
 
         if self.show_about {
-            render_about_modal(ctx, &mut self.show_about);
+            render_about_modal(ui.ctx(), &mut self.show_about);
         }
     }
 }
@@ -427,7 +427,7 @@ pub fn resolve_colors(input: &[String]) -> Vec<[u8; 3]> {
 #[cfg(windows)]
 fn get_monitor_work_area(index: u32) -> Option<(i32, i32, i32, i32, u32, f64)> {
     use windows_sys::Win32::Graphics::Gdi::*;
-    use windows_sys::Win32::Foundation::{BOOL, LPARAM, RECT};
+    use windows_sys::Win32::Foundation::{LPARAM, RECT};
     use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
     use std::mem;
 
@@ -436,7 +436,7 @@ fn get_monitor_work_area(index: u32) -> Option<(i32, i32, i32, i32, u32, f64)> {
         _hdc: HDC,
         _rect: *mut RECT,
         data: LPARAM,
-    ) -> BOOL {
+    ) -> i32 {
         let vec = &mut *(data as *mut Vec<HMONITOR>);
         vec.push(hmon);
         1 // TRUE

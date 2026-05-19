@@ -40,6 +40,15 @@ pub fn render_legend(
         })
         .collect();
 
+    // Theme-aware colors: text follows the current visuals, the translucent
+    // background is dark-on-dark / light-on-light.
+    let base_text = ctx.global_style().visuals.text_color();
+    let legend_fill = if ctx.global_style().visuals.dark_mode {
+        Color32::from_black_alpha(180)
+    } else {
+        Color32::from_white_alpha(200)
+    };
+
     let (legend_anchor, legend_pivot) = match corner {
         Corner::LeftTop => (
             frame_rect.left_top() + egui::vec2(8.0, 8.0),
@@ -67,8 +76,8 @@ pub fn render_legend(
         .interactable(true)
         .show(ctx, |legend_ui| {
             egui::Frame::NONE
-                .fill(Color32::from_black_alpha(180))
-                .stroke(egui::Stroke::new(1.0, Color32::WHITE))
+                .fill(legend_fill)
+                .stroke(egui::Stroke::new(1.0, base_text))
                 .corner_radius(2.0)
                 .inner_margin(6.0)
                 .show(legend_ui, |legend_ui| {
@@ -79,8 +88,16 @@ pub fn render_legend(
                         } else {
                             Color32::from_rgba_unmultiplied(r, g, b, 80)
                         };
-                        let text_alpha = if *visible { 255 } else { 80 };
-                        let text_color = Color32::from_white_alpha(text_alpha);
+                        let text_color = if *visible {
+                            base_text
+                        } else {
+                            Color32::from_rgba_unmultiplied(
+                                base_text.r(),
+                                base_text.g(),
+                                base_text.b(),
+                                80,
+                            )
+                        };
 
                         let normal_fmt = TextFormat {
                             font_id: FontId::new(13.0, FontFamily::Proportional),

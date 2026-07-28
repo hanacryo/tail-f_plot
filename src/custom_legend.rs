@@ -3,8 +3,10 @@ use egui::text::LayoutJob;
 use egui::{Color32, FontFamily, FontId, TextFormat};
 use egui_plot::Corner;
 
-/// One legend row, prepared by the caller (flat across all file groups).
+/// One legend row, prepared by the caller.
 pub struct LegendEntry {
+    /// Index into the app-wide flat series list (visibility toggling).
+    pub flat_idx: usize,
     pub name: String,
     pub color: [u8; 3],
     /// Latest value within the series' visible range (None = nothing to show).
@@ -12,20 +14,18 @@ pub struct LegendEntry {
 }
 
 /// Render custom legend overlay with bold value formatting and click-to-toggle.
-/// `series_visible` is indexed like `entries` (flat across groups).
+/// One legend per sub-plot: `id_salt` (the stack index) keeps the egui Areas
+/// distinct; `series_visible` is indexed by `LegendEntry::flat_idx`.
 pub fn render_legend(
     ctx: &egui::Context,
     frame_rect: egui::Rect,
     corner: Corner,
+    id_salt: usize,
     entries: &[LegendEntry],
-    series_visible: &mut Vec<bool>,
+    series_visible: &mut [bool],
     y_unit: &str,
     is_log_scale: bool,
 ) {
-    // Ensure series_visible has entries for all series
-    while series_visible.len() < entries.len() {
-        series_visible.push(true);
-    }
 
     // Theme-aware colors: text follows the current visuals, the translucent
     // background is dark-on-dark / light-on-light.
@@ -55,7 +55,7 @@ pub fn render_legend(
         ),
     };
 
-    egui::Area::new(egui::Id::new("plot_legend"))
+    egui::Area::new(egui::Id::new(("plot_legend", id_salt)))
         .fixed_pos(legend_anchor)
         .pivot(legend_pivot)
         .order(egui::Order::Foreground)
@@ -68,8 +68,8 @@ pub fn render_legend(
                 .corner_radius(2.0)
                 .inner_margin(6.0)
                 .show(legend_ui, |legend_ui| {
-                    for (i, entry) in entries.iter().enumerate() {
-                        let visible = series_visible.get(i).copied().unwrap_or(true);
+                    for entry in entries.iter() {
+                        let visible = series_visible.get(entry.flat_idx).copied().unwrap_or(true);
                         let [r, g, b] = entry.color;
                         let series_color = if visible {
                             Color32::from_rgb(r, g, b)
@@ -101,19 +101,8 @@ pub fn render_legend(
                         let mut job = LayoutJob::default();
                         job.append(&entry.name, 0.0, normal_fmt.clone());
                         if let Some(v) = entry.latest {
-                            let display_val = if is_log_scale {
-                                let s = format!("{:.6e}", v);
-                                if let Some(e_pos) = s.find('e') {
-                                    let (m, exp) = s.split_at(e_pos);
-                                    let t = m.trim_end_matches('0').trim_end_matches('.');
-                                    format!("{}{}", t, exp)
-                                } else {
-                                    s
-                                }
-                            } else {
-                                let s = format!("{:.6}", v);
-                                s.trim_end_matches('0').trim_end_matches('.').to_string()
-                            };
+                            let display_val =
+                                crate::tooltip::format_series_value(v, is_log_scale);
                             job.append(" : ", 0.0, normal_fmt.clone());
                             job.append(&display_val, 0.0, bold_fmt);
                             job.append(&format!("({})", y_unit), 0.0, normal_fmt);
@@ -131,7 +120,7 @@ pub fn render_legend(
                                     .sense(egui::Sense::click()),
                             );
                             if resp.clicked() {
-                                if let Some(v) = series_visible.get_mut(i) {
+                                if let Some(v) = series_visible.get_mut(entry.flat_idx) {
                                     *v = !*v;
                                 }
                             }

@@ -12,6 +12,7 @@ Built with [egui](https://github.com/emilk/egui) and [egui_plot](https://github.
 - **Flexible CSV parsing**: Configurable delimiter (comma, tab, semicolon, space, pipe), quoted fields, merged delimiters, fixed-width columns.
 - **Multiple Y series**: Plot any combination of columns on a single chart.
 - **Multiple files**: Overlay several files on the same axes with `--` separators, including epoch-time alignment for recordings that started at different times.
+- **Vertical stacks**: Split series into vertically stacked sub-plots (`--y-stacks`) with per-stack Y units, a linked X axis (pan/zoom in sync), and one hover driving the crosshair and tooltip across every sub-plot.
 - **Interactive zoom/pan**: Scroll-wheel zoom, drag pan, box zoom-in, click zoom-out.
 - **Log scale**: Toggle Y-axis log scale at runtime.
 - **Multi-monitor DPI aware**: Per-monitor DPI v2 support with work-area-percentage window placement.
@@ -58,6 +59,11 @@ tail-f_plot.exe a.csv --y-cols 2 -- b.csv
 
 # Aligned by epoch time even though recordings started at different times
 tail-f_plot.exe a.csv --y-cols 2 --epochtime-col 5 -- b.csv
+
+# Three files as three stacked sub-plots (temp / current / voltage)
+tail-f_plot.exe temp.csv --y-cols 5 --y-stacks 1 --y-units K,A,V ^
+  -- current.csv --y-cols 5 --y-stacks 2 ^
+  -- voltage.csv --y-cols 4 --y-stacks 3
 ```
 
 ## Usage
@@ -125,9 +131,11 @@ On successful launch, two lines are printed to stdout and then **no further outp
 | `--x-col <N>` | `1` | X-axis column (1-based) |
 | `--y-cols <N,N,...>` | | Y-axis columns (1-based, comma-separated) |
 | `--y-names <A,B,...>` | | Legend names (comma-separated) |
+| `--y-stacks <N,N,...>` | all `1` | Stack index per Y column (1-based); see below |
 | `--header-row <N>` | `2` | Header row number (1-based) |
 | `--data-start-row <N>` | `3` | Data start row (1-based) |
 | `--y-unit <UNIT>` | | Y-axis unit shown in title and legend |
+| `--y-units <U,U,...>` | | Y-axis unit per stack index (overrides `--y-unit`) |
 | `--log-y` | `false` | Start with Y-axis log scale |
 | `--monitor <N>` | | Target monitor index (0-based) |
 | `--bounds <x1,y1,x2,y2>` | | Window bounds as work-area percentages |
@@ -171,7 +179,7 @@ tail-f_plot.exe a.csv --y-cols 2,3 -- b.csv --y-cols 2 -- c.csv
 
 **Inheritance** — options omitted in a group (even the file path) inherit from the previous group; options given apply to that group and are inherited onward. In the example above `c.csv` uses `--y-cols 2` from the `b.csv` group. A fully empty group (e.g. a trailing `--`) is ignored.
 
-**Per-group options**: `<CSV_PATH>`, `--x-col`, `--y-cols`, `--y-names`, `--header-row`, `--data-start-row`, `--delimiter`, `--string-quote`, `--merge-delimiter`, `--fixed-width`, `--x-time-scale`, `--x-proportion`, `--epochtime-col`, `--epochtime-proportion`. All other options are window-global and belong to the first group only — using one after `--` is an error.
+**Per-group options**: `<CSV_PATH>`, `--x-col`, `--y-cols`, `--y-names`, `--y-stacks`, `--header-row`, `--data-start-row`, `--delimiter`, `--string-quote`, `--merge-delimiter`, `--fixed-width`, `--x-time-scale`, `--x-proportion`, `--epochtime-col`, `--epochtime-proportion`. All other options are window-global and belong to the first group only — using one after `--` is an error.
 
 **Resetting an inherited option**: `--epochtime-col 0` (disable), `--fixed-width 0` (back to delimiter mode), `--merge-delimiter=false`.
 
@@ -184,6 +192,21 @@ tail-f_plot.exe a.csv --y-cols 2 -- b.csv --x-proportion 0.0000166666666667
 **X offset** — without `--absolute-x`, every file shares the first file's X origin (the first file's first row is display x = 0). This aligns files whose X columns run on the same clock. With `--absolute-x`, all files plot raw scaled X values.
 
 **Epoch-time alignment** — when X columns are *elapsed* times (each file starting at 0), shared origin cannot align them. If the files also log an epoch timestamp, give its column via `--epochtime-col`: each later file is then shifted by the wall-clock difference between its first epoch value and the first file's, so recordings that started at different times align exactly. Requires the epoch column on the first file too (inheritance makes this automatic); files without it fall back to the shared origin. The epoch column is scaled by `--epochtime-proportion` (default: the group's `--x-proportion`) — override it when the epoch unit differs from the X-column unit (e.g. epoch in ms, X in s). Ignored under `--absolute-x`.
+
+## Vertical Stacks
+
+`--y-stacks` assigns each Y column a 1-based stack index; series with the same index share one sub-plot, and different indices are laid out top-to-bottom in index order (unused indices are skipped). Works per file group, so multi-file and stacking combine freely:
+
+```
+tail-f_plot.exe temp.csv --y-cols 5 --y-names Temp --y-stacks 1 --y-units K,A,V ^
+  -- current.csv --y-cols 5 --y-names Current --y-stacks 2 ^
+  -- voltage.csv --y-cols 4 --y-names Voltage --y-stacks 3
+```
+
+- **Per-stack units**: `--y-units K,A,V` maps units positionally by stack *index* (stack 3 always takes the third entry). Missing entries fall back to `--y-unit`.
+- **Linked X axis**: dragging or zooming the X range in any sub-plot moves all of them together; Y stays independent per sub-plot. Auto-X fits the union of every stack's data.
+- **One hover, every sub-plot**: the vertical crosshair tracks the cursor's time position across all sub-plots, and the tooltip lists every visible series (all stacks) at that time, each with its stack's unit.
+- **Layout**: sub-plots split the window height equally; the X axis (ticks + label) is drawn on the bottom sub-plot only. Each sub-plot has its own legend.
 
 > **Notes**
 > - Series colors and marker shapes continue across groups; default legend names get a file-stem prefix (`a:Col2`).

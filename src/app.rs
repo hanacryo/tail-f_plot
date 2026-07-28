@@ -1,11 +1,11 @@
 use eframe::egui;
 use egui::{PointerButton, Vec2b};
-use egui_plot::{Line, MarkerShape, Plot, PlotBounds, PlotPoints, Points};
+use egui_plot::{Line, MarkerShape, Plot, PlotBounds, PlotPoint, PlotPoints, PlotResponse, Points};
 
 use crate::csv_watcher::CsvWatcher;
 use crate::custom_legend::LegendEntry;
 use crate::groups::GroupConfig;
-use crate::plot_state::{PlotData, PlotMode};
+use crate::plot_state::{GroupView, PlotData, PlotMode};
 use crate::toolbar::ToolbarState;
 use crate::{Cli, resolve_colors};
 
@@ -17,6 +17,88 @@ const MARKER_SHAPES: [MarkerShape; 5] = [
     MarkerShape::Cross,
     MarkerShape::Plus,
 ];
+
+/// id_salt of the linked-x-axis group shared by all stacked sub-plots
+const X_LINK_GROUP: &str = "tailf_x_link";
+
+/// Minimum y-axis width so stacked sub-plots align horizontally
+const Y_AXIS_MIN_WIDTH: f32 = 52.0;
+
+/// Auto-fit margin fraction (mimics egui_plot's native auto bounds feel)
+const AUTO_MARGIN: f64 = 0.05;
+
+/// Expand a min/max extent by a margin fraction (fixed margin when degenerate).
+fn with_margin((lo, hi): (f64, f64), frac: f64) -> (f64, f64) {
+    let m = (hi - lo).abs() * frac;
+    let m = if m > 0.0 { m } else { 1.0 };
+    (lo - m, hi + m)
+}
+
+/// Union of display-x extents over all renderable groups' visible slices.
+/// Auto-X must fit ALL stacks' data: per-plot native auto would fit each
+/// sub-plot to its own data only and fight the linked x axis.
+fn global_x_extent(data: &PlotData, views: &[Option<GroupView>]) -> Option<(f64, f64)> {
+    let mut ext: Option<(f64, f64)> = None;
+    for (group, view) in data.groups.iter().zip(views) {
+        let Some(v) = view else { continue };
+        let Some(first) = group.series.first() else { continue };
+        let start = v.range.0.min(first.points.len());
+        let end = v.range.1.min(first.points.len());
+        if start >= end {
+            continue;
+        }
+        let lo = first.points[start].0 + v.offset;
+        let hi = first.points[end - 1].0 + v.offset;
+        ext = Some(match ext {
+            None => (lo, hi),
+            Some((a, b)) => (a.min(lo), b.max(hi)),
+        });
+    }
+    ext
+}
+
+/// Y extent (in render space: log10 under log scale) of the visible series
+/// belonging to `stack_id`, over their visible slices.
+fn stack_y_extent(
+    data: &PlotData,
+    views: &[Option<GroupView>],
+    series_stacks: &[usize],
+    series_visible: &[bool],
+    stack_id: usize,
+    is_log_scale: bool,
+) -> Option<(f64, f64)> {
+    let mut ext: Option<(f64, f64)> = None;
+    let mut flat_idx = 0usize;
+    for (gi, group) in data.groups.iter().enumerate() {
+        let view = views.get(gi).copied().flatten();
+        for series in &group.series {
+            let i = flat_idx;
+            flat_idx += 1;
+            if series_stacks.get(i).copied().unwrap_or(1) != stack_id {
+                continue;
+            }
+            if !series_visible.get(i).copied().unwrap_or(true) {
+                continue;
+            }
+            let Some(v) = view else { continue };
+            let start = v.range.0.min(series.points.len());
+            let end = v.range.1.min(series.points.len());
+            for &(_, y_opt) in &series.points[start..end] {
+                let Some(y) = y_opt else { continue };
+                let y_render = if is_log_scale {
+                    if y > 0.0 { y.log10() } else { continue; }
+                } else {
+                    y
+                };
+                ext = Some(match ext {
+                    None => (y_render, y_render),
+                    Some((a, b)) => (a.min(y_render), b.max(y_render)),
+                });
+            }
+        }
+    }
+    ext
+}
 
 /// Deduplicate series names across all groups (flat order): the first
 /// occurrence keeps its name, later ones get "(2)", "(3)", ... suffixes.
@@ -50,7 +132,6 @@ pub struct PlotApp {
     watchers: Vec<CsvWatcher>,
     data: PlotData,
     toolbar: ToolbarState,
-    y_unit: String,
     repaint_interval_ms: u64,
     x_axis_label: String,
     x_unit: String,
@@ -61,12 +142,21 @@ pub struct PlotApp {
     marker_radius: f32,
     /// First group's resolved proportion (used for tooltip time formatting)
     x_proportion: f64,
+    /// Used stack indices, sorted ascending — one sub-plot per entry
+    stacks: Vec<usize>,
+    /// Y unit per entry of `stacks`
+    stack_units: Vec<String>,
     /// Flat across all groups, in (group, series) order
+    series_stacks: Vec<usize>,
+    series_units: Vec<String>,
     series_visible: Vec<bool>,
-    /// Pending bounds for zoom-out (x_min, x_max, y_min, y_max)
-    pending_bounds: Option<(f64, f64, f64, f64)>,
-    /// Currently displayed bounds (saved for drag restore)
-    current_bounds: Option<(f64, f64, f64, f64)>,
+    /// Shared y-axis width (min_width fed to every sub-plot). Ratchets up to
+    /// the widest measured axis so all frames align pixel-exact; resets on Home.
+    y_axis_width: f32,
+    /// Per stack row: pending bounds for zoom-out (x_min, x_max, y_min, y_max)
+    pending_bounds: Vec<Option<(f64, f64, f64, f64)>>,
+    /// Per stack row: currently displayed bounds (saved for drag restore)
+    current_bounds: Vec<Option<(f64, f64, f64, f64)>>,
     /// Physical pixel placement for SetWindowPos: [x, y, width, height]
     target_placement: Option<[i32; 4]>,
     window_title: String,
@@ -114,6 +204,28 @@ impl PlotApp {
             .collect();
         dedupe_series_names(&mut group_names);
 
+        // Flat per-series stack index ((group, series) order, 1-based)
+        let mut series_stacks: Vec<usize> = Vec::new();
+        for (cfg, names) in groups.iter().zip(&group_names) {
+            for i in 0..names.len() {
+                series_stacks.push(cfg.y_stacks.get(i).copied().unwrap_or(1).max(1));
+            }
+        }
+        let mut stacks: Vec<usize> = series_stacks.clone();
+        stacks.sort_unstable();
+        stacks.dedup();
+        if stacks.is_empty() {
+            stacks.push(1);
+        }
+        let stack_unit = |s: usize| -> String {
+            cli.y_units
+                .get(s - 1)
+                .cloned()
+                .unwrap_or_else(|| cli.y_unit.clone())
+        };
+        let stack_units: Vec<String> = stacks.iter().map(|&s| stack_unit(s)).collect();
+        let series_units: Vec<String> = series_stacks.iter().map(|&s| stack_unit(s)).collect();
+
         let mut data = PlotData::new(cli.absolute_x);
         let mut watchers = Vec::new();
         for (cfg, names) in groups.iter().zip(&group_names) {
@@ -128,11 +240,11 @@ impl PlotApp {
         let mut toolbar = ToolbarState::default();
         toolbar.set_log_scale(cli.log_y);
 
+        let n_stacks = stacks.len();
         Self {
             watchers,
             data,
             toolbar,
-            y_unit: cli.y_unit,
             repaint_interval_ms: cli.repaint_interval_ms,
             x_axis_label: if cli.x_unit.is_empty() {
                 cli.x_axis_label.clone()
@@ -146,9 +258,14 @@ impl PlotApp {
             max_x_range: cli.max_x_range,
             marker_radius: cli.marker_radius,
             x_proportion: groups[0].x_proportion,
+            stacks,
+            stack_units,
+            series_stacks,
+            series_units,
             series_visible: vec![true; series_total],
-            pending_bounds: None,
-            current_bounds: None,
+            y_axis_width: Y_AXIS_MIN_WIDTH,
+            pending_bounds: vec![None; n_stacks],
+            current_bounds: vec![None; n_stacks],
             target_placement,
             window_title,
             placement_applied: false,
@@ -196,197 +313,271 @@ impl eframe::App for PlotApp {
             let allow_drag = mode == PlotMode::None;
             let is_zoom_in = mode == PlotMode::ZoomIn;
 
-            // --- Build Plot ---
-            let mut plot = Plot::new("main_plot")
-                .x_axis_label(&self.x_axis_label)
-                .y_axis_label(&self.y_unit)
-                .allow_drag(allow_drag)
-                .allow_scroll(false)
-                .allow_boxed_zoom(is_zoom_in)
-                .boxed_zoom_pointer_button(PointerButton::Primary)
-                .allow_zoom(true)
-                .allow_axis_zoom_drag(false)
-                .allow_double_click_reset(false)
-                .show_x(false) // suppress built-in tooltip (renders empty roundbox in 0.34)
-                .show_y(false)
-                .y_axis_formatter(move |mark, range| {
-                    let range_size = range.end() - range.start();
-                    if is_log_scale {
-                        let real_value = 10_f64.powf(mark.value);
-                        let precision = if range_size >= 2.0 { 0 }
-                            else if range_size >= 1.0 { 1 }
-                            else if range_size >= 0.3 { 2 }
-                            else { 3 };
-                        let s = match precision {
-                            0 => format!("{:.0e}", real_value),
-                            1 => format!("{:.1e}", real_value),
-                            2 => format!("{:.2e}", real_value),
-                            _ => format!("{:.3e}", real_value),
-                        };
-                        if let Some(e_pos) = s.find('e') {
-                            let (mantissa, exp) = s.split_at(e_pos);
-                            let trimmed = mantissa.trim_end_matches('0').trim_end_matches('.');
-                            format!("{}{}", trimmed, exp)
-                        } else { s }
-                    } else {
-                        let precision = if range_size >= 100.0 { 0 }
-                            else if range_size >= 10.0 { 1 }
-                            else if range_size >= 1.0 { 2 }
-                            else if range_size >= 0.1 { 3 }
-                            else { 4 };
-                        let s = match precision {
-                            0 => format!("{:.0}", mark.value),
-                            1 => format!("{:.1}", mark.value),
-                            2 => format!("{:.2}", mark.value),
-                            3 => format!("{:.3}", mark.value),
-                            _ => format!("{:.4}", mark.value),
-                        };
-                        if s.contains('.') {
-                            s.trim_end_matches('0').trim_end_matches('.').to_string()
-                        } else {
-                            s
-                        }
-                    }
-                });
-
-            // --- Bounds management ---
-
-            // Home: reset to full auto view
-            if self.toolbar.need_home {
+            // Home: reset all sub-plots to full auto view
+            let do_reset = self.toolbar.need_home;
+            if do_reset {
                 self.toolbar.auto_x = true;
                 self.toolbar.auto_y = true;
-                self.pending_bounds = None;
-                plot = plot.reset();
+                for p in self.pending_bounds.iter_mut() {
+                    *p = None;
+                }
+                // Re-fit the shared axis width from scratch (ranges change on Home)
+                self.y_axis_width = Y_AXIS_MIN_WIDTH;
                 self.toolbar.need_home = false;
             }
-
-            // Auto toggle: just clear the flag.
-            // set_auto_bounds() handles per-axis auto natively in 0.34.
-            // No plot.reset() needed — reset destroys both axes and causes view jump.
+            // Auto toggle: just clear the flag (set_auto_bounds handles per-axis
+            // auto natively in 0.34; a reset here would cause a view jump).
             if self.toolbar.need_reset {
                 self.toolbar.need_reset = false;
             }
 
             let views = self.data.views(self.max_points, self.max_x_range);
-            let y_unit = self.y_unit.clone();
-            let pending_bounds = self.pending_bounds.take();
             let auto_x = self.toolbar.auto_x;
             let auto_y = self.toolbar.auto_y;
 
-            // --- Plot show ---
-            let response = plot.show(ui, |plot_ui| {
-                // Per-axis auto bounds (0.34 native support)
-                plot_ui.set_auto_bounds(Vec2b::new(auto_x, auto_y));
+            // Manual auto-fit extents (see global_x_extent for why not native)
+            let global_x = global_x_extent(&self.data, &views);
+            let stack_y: Vec<Option<(f64, f64)>> = self
+                .stacks
+                .iter()
+                .map(|&s| {
+                    stack_y_extent(
+                        &self.data,
+                        &views,
+                        &self.series_stacks,
+                        &self.series_visible,
+                        s,
+                        is_log_scale,
+                    )
+                })
+                .collect();
 
-                // Apply programmatic bounds (zoom-out, partial auto restore)
-                if let Some((x_min, x_max, y_min, y_max)) = pending_bounds {
-                    plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                        [x_min, y_min],
-                        [x_max, y_max],
-                    ));
+            let n = self.stacks.len();
+            let spacing_y = ui.spacing().item_spacing.y;
+            let plot_h =
+                ((ui.available_height() - spacing_y * (n as f32 - 1.0)) / n as f32).max(50.0);
+
+            // --- Render every stacked sub-plot, collecting responses ---
+            let mut shows: Vec<PlotResponse<()>> = Vec::with_capacity(n);
+            for (r, &stack_id) in self.stacks.iter().enumerate() {
+                let is_bottom = r == n - 1;
+                let unit = self.stack_units[r].clone();
+                // A blank (not empty) label keeps the unit strip present on
+                // every sub-plot so their axis offsets stay comparable.
+                let axis_label = if n > 1 && unit.is_empty() {
+                    " ".to_string()
+                } else {
+                    unit.clone()
+                };
+
+                let mut plot = Plot::new(("main_plot", stack_id))
+                    .height(plot_h)
+                    .y_axis_label(axis_label)
+                    .y_axis_min_width(self.y_axis_width)
+                    .link_axis(X_LINK_GROUP, Vec2b::new(true, false))
+                    .show_axes(Vec2b::new(is_bottom, true))
+                    .allow_drag(allow_drag)
+                    .allow_scroll(false)
+                    .allow_boxed_zoom(is_zoom_in)
+                    .boxed_zoom_pointer_button(PointerButton::Primary)
+                    .allow_zoom(true)
+                    .allow_axis_zoom_drag(false)
+                    .allow_double_click_reset(false)
+                    .show_x(false) // suppress built-in tooltip (renders empty roundbox in 0.34)
+                    .show_y(false)
+                    .y_axis_formatter(move |mark, range| {
+                        let range_size = range.end() - range.start();
+                        if is_log_scale {
+                            let real_value = 10_f64.powf(mark.value);
+                            let precision = if range_size >= 2.0 { 0 }
+                                else if range_size >= 1.0 { 1 }
+                                else if range_size >= 0.3 { 2 }
+                                else { 3 };
+                            let s = match precision {
+                                0 => format!("{:.0e}", real_value),
+                                1 => format!("{:.1e}", real_value),
+                                2 => format!("{:.2e}", real_value),
+                                _ => format!("{:.3e}", real_value),
+                            };
+                            if let Some(e_pos) = s.find('e') {
+                                let (mantissa, exp) = s.split_at(e_pos);
+                                let trimmed = mantissa.trim_end_matches('0').trim_end_matches('.');
+                                format!("{}{}", trimmed, exp)
+                            } else { s }
+                        } else {
+                            // Dynamic decimals from the visible range's
+                            // magnitude (tiny ranges like 1e-4 A need more
+                            // than a fixed 4-decimal cap).
+                            let precision = if range_size > 0.0 {
+                                (2.0 - range_size.log10().floor()).clamp(0.0, 10.0) as usize
+                            } else {
+                                2
+                            };
+                            let s = format!("{:.*}", precision, mark.value);
+                            if s.contains('.') {
+                                s.trim_end_matches('0').trim_end_matches('.').to_string()
+                            } else {
+                                s
+                            }
+                        }
+                    });
+
+                if is_bottom {
+                    plot = plot.x_axis_label(&self.x_axis_label);
+                }
+                if do_reset {
+                    plot = plot.reset();
                 }
 
-                let mut flat_idx = 0usize;
-                for (gi, group) in self.data.groups.iter().enumerate() {
-                    let view = views.get(gi).copied().flatten();
-                    for series in &group.series {
-                        let i = flat_idx;
-                        flat_idx += 1;
-                        if !self.series_visible.get(i).copied().unwrap_or(true) {
-                            continue;
-                        }
-                        // Offset unresolved yet (e.g. waiting for the first
-                        // file's origin or an epoch anchor): buffer silently.
-                        let Some(view) = view else { continue };
+                let pending = self.pending_bounds[r].take();
+                let current = self.current_bounds[r];
+                let y_fit = stack_y[r];
 
-                        let (start_idx, end_idx) = view.range;
-                        let points_slice = if start_idx < series.points.len() {
-                            &series.points[start_idx..end_idx.min(series.points.len())]
+                let response = plot.show(ui, |plot_ui| {
+                    if auto_x || auto_y {
+                        // Manual auto-fit: X spans the union of all stacks'
+                        // data (native per-plot auto would fit each sub-plot
+                        // to its own data and fight the linked x axis).
+                        let x_range = if auto_x {
+                            global_x.map(|e| with_margin(e, AUTO_MARGIN))
                         } else {
-                            &[]
+                            current.map(|c| (c.0, c.1))
                         };
-
-                        // Latest value for legend display name
-                        let latest_value = points_slice.iter().rev().find_map(|(_, y)| *y);
-                        let legend_name = match latest_value {
-                            Some(v) => {
-                                let display_val = if is_log_scale {
-                                    let s = format!("{:.6e}", v);
-                                    if let Some(e_pos) = s.find('e') {
-                                        let (mantissa, exp) = s.split_at(e_pos);
-                                        let trimmed = mantissa
-                                            .trim_end_matches('0')
-                                            .trim_end_matches('.');
-                                        format!("{}{}", trimmed, exp)
-                                    } else {
-                                        s
-                                    }
-                                } else {
-                                    let s = format!("{:.6}", v);
-                                    s.trim_end_matches('0').trim_end_matches('.').to_string()
-                                };
-                                format!("{} : {}({})", series.name, display_val, y_unit)
-                            }
-                            None => series.name.clone(),
+                        let y_range = if auto_y {
+                            y_fit.map(|e| with_margin(e, AUTO_MARGIN))
+                        } else {
+                            current.map(|c| (c.2, c.3))
                         };
+                        if let (Some((x0, x1)), Some((y0, y1))) = (x_range, y_range) {
+                            plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                                [x0, y0],
+                                [x1, y1],
+                            ));
+                        } else {
+                            // Nothing to fit yet (no data / first frame):
+                            // native per-axis auto as a harmless fallback.
+                            plot_ui.set_auto_bounds(Vec2b::new(auto_x, auto_y));
+                        }
+                    } else if let Some((x_min, x_max, y_min, y_max)) = pending {
+                        // Apply programmatic bounds (zoom-out, partial auto restore)
+                        plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                            [x_min, y_min],
+                            [x_max, y_max],
+                        ));
+                    }
 
-                        // Build line segments, skipping None values (line breaks)
-                        let mut segments: Vec<Vec<[f64; 2]>> = Vec::new();
-                        let mut current_segment: Vec<[f64; 2]> = Vec::new();
-
-                        for &(x, y_opt) in points_slice {
-                            match y_opt {
-                                Some(y) => {
-                                    let y_render = if is_log_scale {
-                                        if y > 0.0 { y.log10() } else { continue; }
-                                    } else {
-                                        y
-                                    };
-                                    current_segment.push([x + view.offset, y_render]);
-                                }
-                                None => {
-                                    if !current_segment.is_empty() {
-                                        segments.push(std::mem::take(&mut current_segment));
-                                    }
-                                }
+                    let mut flat_idx = 0usize;
+                    for (gi, group) in self.data.groups.iter().enumerate() {
+                        let view = views.get(gi).copied().flatten();
+                        for series in &group.series {
+                            let i = flat_idx;
+                            flat_idx += 1;
+                            if self.series_stacks.get(i).copied().unwrap_or(1) != stack_id {
+                                continue;
                             }
-                        }
-                        if !current_segment.is_empty() {
-                            segments.push(current_segment);
-                        }
+                            if !self.series_visible.get(i).copied().unwrap_or(true) {
+                                continue;
+                            }
+                            // Offset unresolved yet (e.g. waiting for the first
+                            // file's origin or an epoch anchor): buffer silently.
+                            let Some(view) = view else { continue };
 
-                        let color_idx = i % self.colors.len();
-                        let [r, g, b] = self.colors[color_idx];
-                        let line_color = egui::Color32::from_rgb(r, g, b);
-                        let marker_color =
-                            egui::Color32::from_rgba_unmultiplied(r, g, b, 204);
-                        let marker_shape = MARKER_SHAPES[i % MARKER_SHAPES.len()];
-
-                        for (seg_idx, seg) in segments.iter().enumerate() {
-                            let line_name = if seg_idx == 0 {
-                                legend_name.clone()
+                            let (start_idx, end_idx) = view.range;
+                            let points_slice = if start_idx < series.points.len() {
+                                &series.points[start_idx..end_idx.min(series.points.len())]
                             } else {
-                                String::new()
+                                &[]
                             };
-                            let line = Line::new(line_name, PlotPoints::new(seg.clone()))
-                                .color(line_color)
-                                .width(self.line_width);
-                            plot_ui.line(line);
 
-                            let points =
-                                Points::new(String::new(), PlotPoints::new(seg.clone()))
-                                    .color(marker_color)
-                                    .radius(self.marker_radius)
-                                    .shape(marker_shape);
-                            plot_ui.points(points);
+                            // Latest value for legend display name
+                            let latest_value = points_slice.iter().rev().find_map(|(_, y)| *y);
+                            let legend_name = match latest_value {
+                                Some(v) => format!(
+                                    "{} : {}({})",
+                                    series.name,
+                                    crate::tooltip::format_series_value(v, is_log_scale),
+                                    unit
+                                ),
+                                None => series.name.clone(),
+                            };
+
+                            // Build line segments, skipping None values (line breaks)
+                            let mut segments: Vec<Vec<[f64; 2]>> = Vec::new();
+                            let mut current_segment: Vec<[f64; 2]> = Vec::new();
+
+                            for &(x, y_opt) in points_slice {
+                                match y_opt {
+                                    Some(y) => {
+                                        let y_render = if is_log_scale {
+                                            if y > 0.0 { y.log10() } else { continue; }
+                                        } else {
+                                            y
+                                        };
+                                        current_segment.push([x + view.offset, y_render]);
+                                    }
+                                    None => {
+                                        if !current_segment.is_empty() {
+                                            segments.push(std::mem::take(&mut current_segment));
+                                        }
+                                    }
+                                }
+                            }
+                            if !current_segment.is_empty() {
+                                segments.push(current_segment);
+                            }
+
+                            let color_idx = i % self.colors.len();
+                            let [r, g, b] = self.colors[color_idx];
+                            let line_color = egui::Color32::from_rgb(r, g, b);
+                            let marker_color =
+                                egui::Color32::from_rgba_unmultiplied(r, g, b, 204);
+                            let marker_shape = MARKER_SHAPES[i % MARKER_SHAPES.len()];
+
+                            for (seg_idx, seg) in segments.iter().enumerate() {
+                                let line_name = if seg_idx == 0 {
+                                    legend_name.clone()
+                                } else {
+                                    String::new()
+                                };
+                                let line = Line::new(line_name, PlotPoints::new(seg.clone()))
+                                    .color(line_color)
+                                    .width(self.line_width);
+                                plot_ui.line(line);
+
+                                let points =
+                                    Points::new(String::new(), PlotPoints::new(seg.clone()))
+                                        .color(marker_color)
+                                        .radius(self.marker_radius)
+                                        .shape(marker_shape);
+                                plot_ui.points(points);
+                            }
                         }
                     }
-                }
-            });
+                });
 
-            // --- Interaction detection ---
-            let plot_response = &response.response;
-            let plot_hovered = plot_response.hovered();
+                shows.push(response);
+            }
+
+            // Pixel-align sub-plot frames: the shared y-axis strip must match
+            // the widest one (actual width = max(min_width, label width), so a
+            // wider-labeled stack sticks out). Every sub-plot widget starts at
+            // the same left x, so the frames' left edges must be identical —
+            // feed the spread back into the shared min_width until they are.
+            if n > 1 {
+                let lefts: Vec<f32> = shows
+                    .iter()
+                    .map(|s| s.transform.frame().left())
+                    .collect();
+                let max_l = lefts.iter().copied().fold(f32::MIN, f32::max);
+                let min_l = lefts.iter().copied().fold(f32::MAX, f32::min);
+                if max_l - min_l > 0.5 && self.y_axis_width < 300.0 {
+                    self.y_axis_width = (self.y_axis_width + (max_l - min_l)).min(300.0);
+                    // Converge right away instead of at the poll interval
+                    ui.ctx().request_repaint();
+                }
+            }
+
+            // --- Interaction detection across sub-plots ---
 
             // Detect user scroll-zoom: raw_input_hook injects ctrl into MouseWheel
             // events, so the wheel delta is consumed as zoom. Check for the raw
@@ -394,22 +585,35 @@ impl eframe::App for PlotApp {
             let wheel_scrolled = ui
                 .ctx()
                 .input(|i| i.events.iter().any(|e| matches!(e, egui::Event::MouseWheel { .. })));
-            let scrolled_on_plot = wheel_scrolled && plot_hovered;
-            let user_interacted =
-                plot_response.dragged() || plot_response.double_clicked() || scrolled_on_plot;
 
-            // Detect box-zoom completion in ZoomIn mode
-            let zoom_in_box_completed = is_zoom_in && plot_response.drag_stopped();
+            let mut any_hovered = false;
+            let mut user_interacted = false;
+            let mut zoom_in_box_completed = false;
+            let mut zoom_out_on: Option<usize> = None;
+            for (r, show) in shows.iter().enumerate() {
+                let pr = &show.response;
+                let hovered = pr.hovered();
+                any_hovered |= hovered;
+                if pr.dragged() || pr.double_clicked() || (wheel_scrolled && hovered) {
+                    user_interacted = true;
+                }
+                if is_zoom_in && pr.drag_stopped() {
+                    zoom_in_box_completed = true;
+                }
+                if mode == PlotMode::ZoomOut && pr.clicked() {
+                    zoom_out_on = Some(r);
+                }
+            }
 
-            // ZoomOut: click to zoom out 1.5x centered on cursor
-            let zoom_out_clicked = mode == PlotMode::ZoomOut && plot_response.clicked();
-            if zoom_out_clicked {
-                if let Some(hover_pos) = plot_response.hover_pos() {
-                    let plot_pos = response.transform.value_from_position(hover_pos);
-                    let bounds = response.transform.bounds();
+            // ZoomOut: click to zoom out 1.5x centered on cursor (that sub-plot;
+            // the x part propagates to the others via the linked axis)
+            if let Some(r) = zoom_out_on {
+                if let Some(hover_pos) = shows[r].response.hover_pos() {
+                    let plot_pos = shows[r].transform.value_from_position(hover_pos);
+                    let bounds = shows[r].transform.bounds();
                     let half_width = (bounds.max()[0] - bounds.min()[0]) / 2.0 * 1.5;
                     let half_height = (bounds.max()[1] - bounds.min()[1]) / 2.0 * 1.5;
-                    self.pending_bounds = Some((
+                    self.pending_bounds[r] = Some((
                         plot_pos.x - half_width,
                         plot_pos.x + half_width,
                         plot_pos.y - half_height,
@@ -419,28 +623,32 @@ impl eframe::App for PlotApp {
             }
 
             // Disable auto on any user interaction (single place to avoid race conditions)
-            if user_interacted || zoom_in_box_completed || zoom_out_clicked {
+            if user_interacted || zoom_in_box_completed || zoom_out_on.is_some() {
                 if self.toolbar.auto_x || self.toolbar.auto_y {
                     self.toolbar.auto_x = false;
                     self.toolbar.auto_y = false;
                     // Save current bounds to prevent jump (unless ZoomOut already set pending)
-                    if self.pending_bounds.is_none() {
-                        self.pending_bounds = self.current_bounds;
+                    for r in 0..n {
+                        if self.pending_bounds[r].is_none() {
+                            self.pending_bounds[r] = self.current_bounds[r];
+                        }
                     }
                 }
             }
 
             // Save current bounds each frame
-            let bounds = response.transform.bounds();
-            self.current_bounds = Some((
-                bounds.min()[0],
-                bounds.max()[0],
-                bounds.min()[1],
-                bounds.max()[1],
-            ));
+            for (r, show) in shows.iter().enumerate() {
+                let bounds = show.transform.bounds();
+                self.current_bounds[r] = Some((
+                    bounds.min()[0],
+                    bounds.max()[0],
+                    bounds.min()[1],
+                    bounds.max()[1],
+                ));
+            }
 
             // Cursor icon per mode
-            if plot_hovered {
+            if any_hovered {
                 match mode {
                     PlotMode::ZoomIn => {
                         ui.ctx()
@@ -454,60 +662,94 @@ impl eframe::App for PlotApp {
                 }
             }
 
-            let frame_rect = *response.transform.frame();
+            // --- Custom tooltip + crosshair synchronized across sub-plots ---
+            let hovered_row = shows.iter().enumerate().find_map(|(r, show)| {
+                let pos = show.response.hover_pos()?;
+                show.transform.frame().contains(pos).then_some((r, pos))
+            });
+            if let Some((r, hover_pos)) = hovered_row {
+                let stack_ctx = crate::tooltip::StackContext {
+                    series_stacks: &self.series_stacks,
+                    series_units: &self.series_units,
+                    hovered_stack: self.stacks[r],
+                };
+                let hover = crate::tooltip::find_hover(
+                    hover_pos,
+                    &shows[r].transform,
+                    &self.data,
+                    &views,
+                    &stack_ctx,
+                    &self.series_visible,
+                    &self.colors,
+                    is_log_scale,
+                    400.0, // 20px squared
+                );
 
-            // --- Custom tooltip (manual hover detection, no built-in tooltip) ---
-            if let Some(hover_pos) = plot_response.hover_pos() {
-                if frame_rect.contains(hover_pos) {
-                    let hover = crate::tooltip::find_hover(
-                        hover_pos,
-                        &response.transform,
-                        &self.data,
-                        &views,
-                        &self.series_visible,
-                        &self.colors,
-                        is_log_scale,
-                        400.0, // 20px squared
-                    );
-                    crate::tooltip::render_crosshair(ui, frame_rect, hover.anchor);
-                    crate::tooltip::render_tooltip(
-                        ui,
-                        frame_rect,
-                        &hover,
-                        &self.x_unit,
-                        self.x_proportion,
-                        is_log_scale,
-                        &self.y_unit,
-                    );
+                // Vertical line at the same data X in every sub-plot; the
+                // horizontal line only in the hovered one.
+                let anchor_x = shows[r].transform.value_from_position(hover.anchor).x;
+                for (rr, show) in shows.iter().enumerate() {
+                    let frame = *show.transform.frame();
+                    let sx = if rr == r {
+                        hover.anchor.x
+                    } else {
+                        show.transform
+                            .position_from_point(&PlotPoint::new(anchor_x, 0.0))
+                            .x
+                    };
+                    crate::tooltip::render_crosshair_v(ui, frame, sx);
+                    if rr == r {
+                        crate::tooltip::render_crosshair_h(ui, frame, hover.anchor.y);
+                    }
                 }
+
+                crate::tooltip::render_tooltip(
+                    ui,
+                    *shows[r].transform.frame(),
+                    &hover,
+                    &self.x_unit,
+                    self.x_proportion,
+                    is_log_scale,
+                    &self.stack_units[r],
+                );
             }
 
-            // --- Custom legend ---
-            let mut legend_entries: Vec<LegendEntry> = Vec::new();
-            for (gi, group) in self.data.groups.iter().enumerate() {
-                let view = views.get(gi).copied().flatten();
-                for series in &group.series {
-                    let latest = view.and_then(|v| {
-                        let start = v.range.0.min(series.points.len());
-                        let end = v.range.1.min(series.points.len());
-                        series.points[start..end].iter().rev().find_map(|(_, y)| *y)
-                    });
-                    legend_entries.push(LegendEntry {
-                        name: series.name.clone(),
-                        color: self.colors[legend_entries.len() % self.colors.len()],
-                        latest,
-                    });
+            // --- Custom legend (one per sub-plot, its own series only) ---
+            for (r, &stack_id) in self.stacks.iter().enumerate() {
+                let mut legend_entries: Vec<LegendEntry> = Vec::new();
+                let mut flat_idx = 0usize;
+                for (gi, group) in self.data.groups.iter().enumerate() {
+                    let view = views.get(gi).copied().flatten();
+                    for series in &group.series {
+                        let i = flat_idx;
+                        flat_idx += 1;
+                        if self.series_stacks.get(i).copied().unwrap_or(1) != stack_id {
+                            continue;
+                        }
+                        let latest = view.and_then(|v| {
+                            let start = v.range.0.min(series.points.len());
+                            let end = v.range.1.min(series.points.len());
+                            series.points[start..end].iter().rev().find_map(|(_, y)| *y)
+                        });
+                        legend_entries.push(LegendEntry {
+                            flat_idx: i,
+                            name: series.name.clone(),
+                            color: self.colors[i % self.colors.len()],
+                            latest,
+                        });
+                    }
                 }
+                crate::custom_legend::render_legend(
+                    ui.ctx(),
+                    *shows[r].transform.frame(),
+                    self.toolbar.legend_pos,
+                    stack_id,
+                    &legend_entries,
+                    &mut self.series_visible,
+                    &self.stack_units[r],
+                    is_log_scale,
+                );
             }
-            crate::custom_legend::render_legend(
-                ui.ctx(),
-                frame_rect,
-                self.toolbar.legend_pos,
-                &legend_entries,
-                &mut self.series_visible,
-                &self.y_unit,
-                is_log_scale,
-            );
         });
     }
 }

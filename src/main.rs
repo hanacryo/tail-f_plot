@@ -228,6 +228,15 @@ pub struct Cli {
     #[arg(long, value_delimiter = ',')]
     y_names: Vec<String>,
 
+    /// Stack index per Y column (1-based, comma separated): series with the
+    /// same index share one sub-plot; different indices stack vertically.
+    #[arg(long, value_delimiter = ',')]
+    y_stacks: Vec<usize>,
+
+    /// Y-axis unit per stack index (comma separated; overrides --y-unit)
+    #[arg(long, value_delimiter = ',')]
+    y_units: Vec<String>,
+
     /// Header row number (1-based)
     #[arg(long, default_value_t = 2)]
     header_row: usize,
@@ -367,9 +376,12 @@ fn help_text() -> String {
         --x-col <N>              X-axis column (1-based) [default: 1]\n\
         --y-cols <N,N,...>       Y-axis columns (comma separated)\n\
         --y-names <A,B,...>      Y-axis legend names (comma separated)\n\
+        --y-stacks <N,N,...>     Stack index per Y column (1-based): series\n\
+        \x20                        with different indices stack vertically\n\
         --header-row <N>         Header row number [default: 2]\n\
         --data-start-row <N>     Data start row [default: 3]\n\
         --y-unit <UNIT>          Y-axis unit (shown in title)\n\
+        --y-units <U,U,...>      Y-axis unit per stack index (overrides --y-unit)\n\
         --log-y                  Start with log scale on Y-axis\n\
         --monitor <N>            Monitor index (0-based)\n\
         --bounds <x1,y1,x2,y2>  Window bounds (work-area %)\n\
@@ -396,7 +408,7 @@ fn help_text() -> String {
         Multi-file:\n\
         `--` starts a new file group plotted on the same axes. Omitted options\n\
         (even the file path) inherit from the previous group. Per-group options:\n\
-        x-col, y-cols, y-names, header-row, data-start-row, delimiter,\n\
+        x-col, y-cols, y-names, y-stacks, header-row, data-start-row, delimiter,\n\
         string-quote, merge-delimiter, fixed-width, x-time-scale, x-proportion,\n\
         epochtime-col, epochtime-proportion. All other options are global and\n\
         belong to the first group.\n\

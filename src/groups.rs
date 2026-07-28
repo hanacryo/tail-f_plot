@@ -57,6 +57,10 @@ pub struct GroupCli {
     #[arg(long, value_delimiter = ',')]
     y_names: Option<Vec<String>>,
 
+    /// Stack index per Y column (1-based, comma separated)
+    #[arg(long, value_delimiter = ',')]
+    y_stacks: Option<Vec<usize>>,
+
     /// Header row number (1-based)
     #[arg(long)]
     header_row: Option<usize>,
@@ -105,6 +109,8 @@ pub struct GroupConfig {
     pub x_col: usize,
     pub y_cols: Vec<usize>,
     pub y_names: Vec<String>,
+    /// Stack index per Y column (1-based; missing entries default to 1)
+    pub y_stacks: Vec<usize>,
     pub header_row: usize,
     pub data_start_row: usize,
     /// Resolved delimiter string (e.g. "," or "\t")
@@ -128,6 +134,7 @@ impl GroupConfig {
             x_col: cli.x_col,
             y_cols: cli.y_cols.clone(),
             y_names: cli.y_names.clone(),
+            y_stacks: cli.y_stacks.clone(),
             header_row: cli.header_row,
             data_start_row: cli.data_start_row,
             delimiter: resolve_delimiter(&cli.delimiter),
@@ -158,6 +165,7 @@ impl GroupConfig {
             x_col: g.x_col.unwrap_or(self.x_col),
             y_cols: g.y_cols.clone().unwrap_or_else(|| self.y_cols.clone()),
             y_names: g.y_names.clone().unwrap_or_else(|| self.y_names.clone()),
+            y_stacks: g.y_stacks.clone().unwrap_or_else(|| self.y_stacks.clone()),
             header_row: g.header_row.unwrap_or(self.header_row),
             data_start_row: g.data_start_row.unwrap_or(self.data_start_row),
             delimiter: g
@@ -202,6 +210,7 @@ mod tests {
             x_col: 1,
             y_cols: vec![2, 3],
             y_names: vec!["A".into(), "B".into()],
+            y_stacks: Vec::new(),
             header_row: 2,
             data_start_row: 3,
             delimiter: ",".into(),
@@ -252,6 +261,20 @@ mod tests {
         assert_eq!(next.csv_path, PathBuf::from("b.csv"));
         assert_eq!(next.y_cols, vec![2, 3]);
         assert_eq!(next.y_names, vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn y_stacks_override_and_inherit() {
+        let mut base = base_config();
+        base.y_stacks = vec![1, 2];
+
+        let g = GroupCli::try_parse_from(strs(&["b.csv"])).unwrap();
+        let inherited = base.apply(&g);
+        assert_eq!(inherited.y_stacks, vec![1, 2]);
+
+        let g = GroupCli::try_parse_from(strs(&["--y-stacks", "3,3"])).unwrap();
+        let overridden = inherited.apply(&g);
+        assert_eq!(overridden.y_stacks, vec![3, 3]);
     }
 
     #[test]

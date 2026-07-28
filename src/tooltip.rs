@@ -10,6 +10,20 @@ pub struct SeriesValue {
     pub name: String,
     pub color: [u8; 3],
     pub y: f64,
+    /// Y unit of the series' stack (shown after the value).
+    pub unit: String,
+    /// Stack index the series belongs to (tooltip rows group by stack).
+    pub stack: usize,
+}
+
+/// Flat per-series stack metadata for `find_hover`.
+pub struct StackContext<'a> {
+    /// Stack index per flat series ((group, series) order, 1-based)
+    pub series_stacks: &'a [usize],
+    /// Y unit per flat series
+    pub series_units: &'a [String],
+    /// Stack index of the sub-plot under the cursor (snap targets only it)
+    pub hovered_stack: usize,
 }
 
 /// Result of hover detection. The tooltip layout is always the same:
@@ -69,8 +83,10 @@ fn extent_contains(points: &[(f64, Option<f64>)], range: (usize, usize), raw_tar
 /// Series within a file group are row-aligned, so one row index per group
 /// yields one X and one Y per series of that group. The anchor row is chosen
 /// by point-snap when the cursor is within `interact_radius_sq` of a plotted
-/// point, otherwise by nearest display X to the cursor across all groups;
-/// every other group then contributes its own row nearest to that X.
+/// point of the hovered stack's sub-plot, otherwise by nearest display X to
+/// the cursor across all groups; every other group then contributes its own
+/// row nearest to that X. Values come from every stack (the X axis is shared
+/// across sub-plots), each labeled with its stack's unit.
 /// `views` carries each group's visible index range and display offset
 /// (None = the group is not renderable yet).
 pub fn find_hover(
@@ -78,6 +94,7 @@ pub fn find_hover(
     transform: &PlotTransform,
     data: &PlotData,
     views: &[Option<GroupView>],
+    stack: &StackContext<'_>,
     series_visible: &[bool],
     colors: &[[u8; 3]],
     is_log_scale: bool,
@@ -125,6 +142,11 @@ pub fn find_hover(
         let check_end = (hv_idx + 5).min(end_idx);
 
         for (si, s) in group.series.iter().enumerate() {
+            // Snap only to points drawn in the hovered sub-plot — other
+            // stacks' screen coordinates belong to different transforms.
+            if stack.series_stacks.get(base + si).copied().unwrap_or(1) != stack.hovered_stack {
+                continue;
+            }
             if !series_visible.get(base + si).copied().unwrap_or(true) {
                 continue;
             }
@@ -208,13 +230,18 @@ pub fn find_hover(
                     name: s.name.clone(),
                     color: colors[(base + si) % colors.len()],
                     y,
+                    unit: stack.series_units.get(base + si).cloned().unwrap_or_default(),
+                    stack: stack.series_stacks.get(base + si).copied().unwrap_or(1),
                 });
             }
         }
     }
-    // Larger values first; `sort_by` is stable so ties keep legend order.
+    // Group rows by stack (sub-plot order), larger values first within one;
+    // `sort_by` is stable so ties keep legend order.
     values.sort_by(|a, b| {
-        b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal)
+        a.stack
+            .cmp(&b.stack)
+            .then(b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal))
     });
 
     HoverResult {
@@ -225,42 +252,52 @@ pub fn find_hover(
     }
 }
 
-/// Draw faint dashed crosshair lines tracking the cursor across the plot.
-pub fn render_crosshair(ui: &Ui, frame_rect: Rect, cursor: egui::Pos2) {
-    if !frame_rect.contains(cursor) {
-        return;
-    }
-    // Faint, theme-aware: tint of the current text color so it shows on both
-    // light and dark backgrounds.
+/// Faint, theme-aware crosshair stroke: tint of the current text color so it
+/// shows on both light and dark backgrounds.
+fn crosshair_stroke(ui: &Ui) -> egui::Stroke {
     let base = ui.visuals().text_color();
     let color = Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 70);
+    egui::Stroke::new(1.0, color)
+}
+
+/// Dashed vertical crosshair line at screen `x` (drawn in every sub-plot to
+/// mark the same data X across the stack).
+pub fn render_crosshair_v(ui: &Ui, frame_rect: Rect, x: f32) {
+    if x < frame_rect.left() || x > frame_rect.right() {
+        return;
+    }
     let painter = ui.painter().with_clip_rect(frame_rect);
-    let stroke = egui::Stroke::new(1.0, color);
-    // Vertical line.
     painter.extend(egui::Shape::dashed_line(
         &[
-            egui::pos2(cursor.x, frame_rect.top()),
-            egui::pos2(cursor.x, frame_rect.bottom()),
+            egui::pos2(x, frame_rect.top()),
+            egui::pos2(x, frame_rect.bottom()),
         ],
-        stroke,
+        crosshair_stroke(ui),
         4.0,
         4.0,
     ));
-    // Horizontal line.
+}
+
+/// Dashed horizontal crosshair line at screen `y` (hovered sub-plot only).
+pub fn render_crosshair_h(ui: &Ui, frame_rect: Rect, y: f32) {
+    if y < frame_rect.top() || y > frame_rect.bottom() {
+        return;
+    }
+    let painter = ui.painter().with_clip_rect(frame_rect);
     painter.extend(egui::Shape::dashed_line(
         &[
-            egui::pos2(frame_rect.left(), cursor.y),
-            egui::pos2(frame_rect.right(), cursor.y),
+            egui::pos2(frame_rect.left(), y),
+            egui::pos2(frame_rect.right(), y),
         ],
-        stroke,
+        crosshair_stroke(ui),
         4.0,
         4.0,
     ));
 }
 
 /// Render the tooltip: row 1 is the X (`t =`/`x =`), row 2 is the free cursor
-/// `y =`, and rows 3.. are each visible series (`swatch + name = value`) at
-/// the hovered row, in legend order.
+/// `y =` (in the hovered stack's unit), and rows 3.. are each visible series
+/// (`swatch + name = value (unit)`) at the hovered row, grouped by stack.
 pub fn render_tooltip(
     ui: &Ui,
     frame_rect: Rect,
@@ -268,7 +305,7 @@ pub fn render_tooltip(
     x_unit: &str,
     x_proportion: f64,
     is_log_scale: bool,
-    y_unit: &str,
+    pointer_unit: &str,
 ) {
     if !frame_rect.contains(hover.anchor) {
         return;
@@ -306,23 +343,23 @@ pub fn render_tooltip(
     rows.push((ui.fonts_mut(|f| f.layout_job(x_job)), None));
 
     // Helper to build a `label = value (unit)` row galley.
-    let value_row = |label: &str, y: f64| {
+    let value_row = |label: &str, y: f64, unit: &str| {
         let mut job = LayoutJob::default();
         job.append(label, 0.0, normal_fmt.clone());
         job.append(" = ", 0.0, normal_fmt.clone());
         job.append(&format_y_value(y, is_log_scale), 0.0, bold_fmt.clone());
-        if !y_unit.is_empty() {
-            job.append(&format!(" ({})", y_unit), 0.0, normal_fmt.clone());
+        if !unit.is_empty() {
+            job.append(&format!(" ({})", unit), 0.0, normal_fmt.clone());
         }
         ui.fonts_mut(|f| f.layout_job(job))
     };
 
     // Row 2: pointer Y (snapped point's Y when snapped, else free cursor Y).
-    rows.push((value_row("y", hover.pointer_y), None));
+    rows.push((value_row("y", hover.pointer_y, pointer_unit), None));
 
     // Rows 3..: visible series at the hovered row.
     for v in &hover.values {
-        rows.push((value_row(&v.name, v.y), Some(v.color)));
+        rows.push((value_row(&v.name, v.y, &v.unit), Some(v.color)));
     }
 
     // Geometry. Swatched rows reserve a column on the left; the X / Y rows are
@@ -471,6 +508,21 @@ mod tests {
     }
 
     #[test]
+    fn small_values_keep_significant_digits() {
+        use super::{format_series_value, format_y_value};
+        // 1.00214e-4 must not collapse to "0.0001"
+        assert_eq!(format_y_value(0.000100214, false), "0.00010021");
+        assert_eq!(format_series_value(0.000100214, false), "0.00010021");
+        // Ordinary magnitudes keep the existing formatting
+        assert_eq!(format_series_value(297.6315, false), "297.6315");
+        assert_eq!(format_y_value(298.29, false), "298.29");
+        assert_eq!(format_series_value(0.5878, false), "0.5878");
+        assert_eq!(format_series_value(0.0, false), "0");
+        // Negative small values keep sign and digits
+        assert_eq!(format_series_value(-0.000100214, false), "-0.00010021");
+    }
+
+    #[test]
     fn extent_follows_visible_range_not_full_data() {
         let p = pts(&[0.0, 10.0, 20.0, 30.0]);
         // Only rows [1..3) visible: extent is [10, 20]
@@ -499,6 +551,12 @@ mod tests {
     }
 }
 
+/// Decimal places for a small magnitude (< 0.001): enough significant digits
+/// that values like 1.00214e-4 don't collapse to "0.0001".
+fn small_value_decimals(abs: f64) -> usize {
+    ((4.0 - abs.log10().floor()) as usize).min(10)
+}
+
 /// Format a raw Y value for display (scientific in log scale, fixed otherwise).
 fn format_y_value(y: f64, is_log_scale: bool) -> String {
     if is_log_scale {
@@ -520,8 +578,37 @@ fn format_y_value(y: f64, is_log_scale: bool) -> String {
             format!("{:.3}", y)
         } else if abs_val >= 1.0 {
             format!("{:.4}", y)
+        } else if abs_val > 0.0 && abs_val < 0.001 {
+            format!("{:.*}", small_value_decimals(abs_val), y)
         } else {
             format!("{:.6}", y)
+        };
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            s
+        }
+    }
+}
+
+/// Format a series' latest value for the legend: up to 6 decimals (trimmed),
+/// scientific under log scale, extra decimals for tiny magnitudes.
+pub fn format_series_value(v: f64, is_log_scale: bool) -> String {
+    if is_log_scale {
+        let s = format!("{:.6e}", v);
+        if let Some(e_pos) = s.find('e') {
+            let (mantissa, exp) = s.split_at(e_pos);
+            let trimmed = mantissa.trim_end_matches('0').trim_end_matches('.');
+            format!("{}{}", trimmed, exp)
+        } else {
+            s
+        }
+    } else {
+        let abs = v.abs();
+        let s = if abs > 0.0 && abs < 0.001 {
+            format!("{:.*}", small_value_decimals(abs), v)
+        } else {
+            format!("{:.6}", v)
         };
         if s.contains('.') {
             s.trim_end_matches('0').trim_end_matches('.').to_string()

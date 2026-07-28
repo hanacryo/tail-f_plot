@@ -17,6 +17,7 @@ Thumbs.db
 *.log
 *.tmp
 *.swp
+*.local
 
 # Test data
 *.csv

@@ -3,42 +3,29 @@ use egui::text::LayoutJob;
 use egui::{Color32, FontFamily, FontId, TextFormat};
 use egui_plot::Corner;
 
-use crate::plot_state::SeriesData;
+/// One legend row, prepared by the caller (flat across all file groups).
+pub struct LegendEntry {
+    pub name: String,
+    pub color: [u8; 3],
+    /// Latest value within the series' visible range (None = nothing to show).
+    pub latest: Option<f64>,
+}
 
 /// Render custom legend overlay with bold value formatting and click-to-toggle.
+/// `series_visible` is indexed like `entries` (flat across groups).
 pub fn render_legend(
     ctx: &egui::Context,
     frame_rect: egui::Rect,
     corner: Corner,
-    series: &[SeriesData],
+    entries: &[LegendEntry],
     series_visible: &mut Vec<bool>,
-    colors: &[[u8; 3]],
-    render_range: Option<(usize, usize)>,
     y_unit: &str,
     is_log_scale: bool,
 ) {
     // Ensure series_visible has entries for all series
-    while series_visible.len() < series.len() {
+    while series_visible.len() < entries.len() {
         series_visible.push(true);
     }
-
-    // Collect legend entry data
-    let entries: Vec<(String, [u8; 3], bool, Option<f64>)> = series
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let visible = series_visible.get(i).copied().unwrap_or(true);
-            let color = colors[i % colors.len()];
-            let (si, ei) = render_range.unwrap_or((0, s.points.len()));
-            let slice = if si < s.points.len() {
-                &s.points[si..ei.min(s.points.len())]
-            } else {
-                &[]
-            };
-            let latest = slice.iter().rev().find_map(|(_, y)| *y);
-            (s.name.clone(), color, visible, latest)
-        })
-        .collect();
 
     // Theme-aware colors: text follows the current visuals, the translucent
     // background is dark-on-dark / light-on-light.
@@ -81,14 +68,15 @@ pub fn render_legend(
                 .corner_radius(2.0)
                 .inner_margin(6.0)
                 .show(legend_ui, |legend_ui| {
-                    for (i, (name, color_rgb, visible, latest)) in entries.iter().enumerate() {
-                        let [r, g, b] = *color_rgb;
-                        let series_color = if *visible {
+                    for (i, entry) in entries.iter().enumerate() {
+                        let visible = series_visible.get(i).copied().unwrap_or(true);
+                        let [r, g, b] = entry.color;
+                        let series_color = if visible {
                             Color32::from_rgb(r, g, b)
                         } else {
                             Color32::from_rgba_unmultiplied(r, g, b, 80)
                         };
-                        let text_color = if *visible {
+                        let text_color = if visible {
                             base_text
                         } else {
                             Color32::from_rgba_unmultiplied(
@@ -111,8 +99,8 @@ pub fn render_legend(
                         };
 
                         let mut job = LayoutJob::default();
-                        job.append(name, 0.0, normal_fmt.clone());
-                        if let Some(v) = latest {
+                        job.append(&entry.name, 0.0, normal_fmt.clone());
+                        if let Some(v) = entry.latest {
                             let display_val = if is_log_scale {
                                 let s = format!("{:.6e}", v);
                                 if let Some(e_pos) = s.find('e') {

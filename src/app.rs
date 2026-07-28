@@ -3,9 +3,11 @@ use egui::{PointerButton, Vec2b};
 use egui_plot::{Line, MarkerShape, Plot, PlotBounds, PlotPoints, Points};
 
 use crate::csv_watcher::CsvWatcher;
+use crate::custom_legend::LegendEntry;
+use crate::groups::GroupConfig;
 use crate::plot_state::{PlotData, PlotMode};
 use crate::toolbar::ToolbarState;
-use crate::{Cli, resolve_colors, resolve_delimiter, resolve_string_quote};
+use crate::{Cli, resolve_colors};
 
 /// Cycle marker shapes per series index
 const MARKER_SHAPES: [MarkerShape; 5] = [
@@ -16,8 +18,36 @@ const MARKER_SHAPES: [MarkerShape; 5] = [
     MarkerShape::Plus,
 ];
 
+/// Deduplicate series names across all groups (flat order): the first
+/// occurrence keeps its name, later ones get "(2)", "(3)", ... suffixes.
+/// Covers inherited --y-names, explicit duplicates, and the same file
+/// appearing in several groups.
+fn dedupe_series_names(groups: &mut [Vec<String>]) {
+    use std::collections::{HashMap, HashSet};
+    let mut used: HashSet<String> = HashSet::new();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for names in groups.iter_mut() {
+        for name in names.iter_mut() {
+            let count = counts.entry(name.clone()).or_insert(0);
+            *count += 1;
+            let mut candidate = if *count == 1 {
+                name.clone()
+            } else {
+                format!("{}({})", name, count)
+            };
+            // A suffixed name may itself collide with an explicit name
+            // (e.g. "A", "A", "A(2)") — keep bumping until unique.
+            while !used.insert(candidate.clone()) {
+                *count += 1;
+                candidate = format!("{}({})", name, count);
+            }
+            *name = candidate;
+        }
+    }
+}
+
 pub struct PlotApp {
-    watcher: CsvWatcher,
+    watchers: Vec<CsvWatcher>,
     data: PlotData,
     toolbar: ToolbarState,
     y_unit: String,
@@ -29,7 +59,9 @@ pub struct PlotApp {
     max_points: usize,
     max_x_range: f64,
     marker_radius: f32,
+    /// First group's resolved proportion (used for tooltip time formatting)
     x_proportion: f64,
+    /// Flat across all groups, in (group, series) order
     series_visible: Vec<bool>,
     /// Pending bounds for zoom-out (x_min, x_max, y_min, y_max)
     pending_bounds: Option<(f64, f64, f64, f64)>,
@@ -45,41 +77,60 @@ impl PlotApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         cli: Cli,
+        groups: Vec<GroupConfig>,
         window_title: String,
         target_placement: Option<[i32; 4]>,
     ) -> Self {
         crate::register_fonts(&cc.egui_ctx);
 
-        let names: Vec<String> = if cli.y_names.is_empty() {
-            cli.y_cols.iter().map(|c| format!("Col{}", c)).collect()
-        } else {
-            cli.y_names.clone()
-        };
-
-        let delimiter = resolve_delimiter(&cli.delimiter);
-        let string_quote = resolve_string_quote(&cli.string_quote);
         let colors = resolve_colors(&cli.colors);
+        let multi_file = groups.len() > 1;
 
-        let mut watcher = CsvWatcher::new(
-            cli.csv_path.unwrap(),
-            cli.x_col,
-            &cli.y_cols,
-            cli.header_row,
-            cli.data_start_row,
-            delimiter,
-            cli.fixed_width,
-            string_quote,
-            cli.merge_delimiter,
-            cli.x_proportion,
-        );
-        watcher.start();
+        let mut group_names: Vec<Vec<String>> = groups
+            .iter()
+            .map(|cfg| {
+                if cfg.y_names.is_empty() {
+                    // Default names get a file-stem prefix in multi-file mode so
+                    // identical column numbers from different files stay distinct.
+                    let stem = cfg
+                        .csv_path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    cfg.y_cols
+                        .iter()
+                        .map(|c| {
+                            if multi_file {
+                                format!("{}:Col{}", stem, c)
+                            } else {
+                                format!("Col{}", c)
+                            }
+                        })
+                        .collect()
+                } else {
+                    cfg.y_names.clone()
+                }
+            })
+            .collect();
+        dedupe_series_names(&mut group_names);
+
+        let mut data = PlotData::new(cli.absolute_x);
+        let mut watchers = Vec::new();
+        for (cfg, names) in groups.iter().zip(&group_names) {
+            data.add_group(names, cfg.epochtime_col > 0);
+
+            let mut watcher = CsvWatcher::new(cfg);
+            watcher.start();
+            watchers.push(watcher);
+        }
+        let series_total = data.series_count();
 
         let mut toolbar = ToolbarState::default();
         toolbar.set_log_scale(cli.log_y);
 
         Self {
-            watcher,
-            data: PlotData::new(&names, cli.absolute_x),
+            watchers,
+            data,
             toolbar,
             y_unit: cli.y_unit,
             repaint_interval_ms: cli.repaint_interval_ms,
@@ -94,8 +145,8 @@ impl PlotApp {
             max_points: cli.max_points,
             max_x_range: cli.max_x_range,
             marker_radius: cli.marker_radius,
-            x_proportion: cli.x_proportion,
-            series_visible: vec![true; names.len()],
+            x_proportion: groups[0].x_proportion,
+            series_visible: vec![true; series_total],
             pending_bounds: None,
             current_bounds: None,
             target_placement,
@@ -125,7 +176,9 @@ impl eframe::App for PlotApp {
             }
         }
 
-        self.watcher.poll(&mut self.data);
+        for (i, watcher) in self.watchers.iter_mut().enumerate() {
+            watcher.poll(&mut self.data, i);
+        }
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(self.repaint_interval_ms));
 
@@ -214,7 +267,7 @@ impl eframe::App for PlotApp {
                 self.toolbar.need_reset = false;
             }
 
-            let render_range = self.data.get_render_range(self.max_points, self.max_x_range);
+            let views = self.data.views(self.max_points, self.max_x_range);
             let y_unit = self.y_unit.clone();
             let pending_bounds = self.pending_bounds.take();
             let auto_x = self.toolbar.auto_x;
@@ -233,92 +286,100 @@ impl eframe::App for PlotApp {
                     ));
                 }
 
-                for (i, series) in self.data.series.iter().enumerate() {
-                    if !self.series_visible.get(i).copied().unwrap_or(true) {
-                        continue;
-                    }
-
-                    let (start_idx, end_idx) =
-                        render_range.unwrap_or((0, series.points.len()));
-                    let points_slice = if start_idx < series.points.len() {
-                        &series.points[start_idx..end_idx.min(series.points.len())]
-                    } else {
-                        &[]
-                    };
-
-                    // Latest value for legend display name
-                    let latest_value = points_slice.iter().rev().find_map(|(_, y)| *y);
-                    let legend_name = match latest_value {
-                        Some(v) => {
-                            let display_val = if is_log_scale {
-                                let s = format!("{:.6e}", v);
-                                if let Some(e_pos) = s.find('e') {
-                                    let (mantissa, exp) = s.split_at(e_pos);
-                                    let trimmed = mantissa
-                                        .trim_end_matches('0')
-                                        .trim_end_matches('.');
-                                    format!("{}{}", trimmed, exp)
-                                } else {
-                                    s
-                                }
-                            } else {
-                                let s = format!("{:.6}", v);
-                                s.trim_end_matches('0').trim_end_matches('.').to_string()
-                            };
-                            format!("{} : {}({})", series.name, display_val, y_unit)
+                let mut flat_idx = 0usize;
+                for (gi, group) in self.data.groups.iter().enumerate() {
+                    let view = views.get(gi).copied().flatten();
+                    for series in &group.series {
+                        let i = flat_idx;
+                        flat_idx += 1;
+                        if !self.series_visible.get(i).copied().unwrap_or(true) {
+                            continue;
                         }
-                        None => series.name.clone(),
-                    };
+                        // Offset unresolved yet (e.g. waiting for the first
+                        // file's origin or an epoch anchor): buffer silently.
+                        let Some(view) = view else { continue };
 
-                    // Build line segments, skipping None values (line breaks)
-                    let mut segments: Vec<Vec<[f64; 2]>> = Vec::new();
-                    let mut current_segment: Vec<[f64; 2]> = Vec::new();
-
-                    for &(x, y_opt) in points_slice {
-                        match y_opt {
-                            Some(y) => {
-                                let y_render = if is_log_scale {
-                                    if y > 0.0 { y.log10() } else { continue; }
-                                } else {
-                                    y
-                                };
-                                current_segment.push([x, y_render]);
-                            }
-                            None => {
-                                if !current_segment.is_empty() {
-                                    segments.push(std::mem::take(&mut current_segment));
-                                }
-                            }
-                        }
-                    }
-                    if !current_segment.is_empty() {
-                        segments.push(current_segment);
-                    }
-
-                    let color_idx = i % self.colors.len();
-                    let [r, g, b] = self.colors[color_idx];
-                    let line_color = egui::Color32::from_rgb(r, g, b);
-                    let marker_color =
-                        egui::Color32::from_rgba_unmultiplied(r, g, b, 204);
-                    let marker_shape = MARKER_SHAPES[i % MARKER_SHAPES.len()];
-
-                    for (seg_idx, seg) in segments.iter().enumerate() {
-                        let line_name = if seg_idx == 0 {
-                            legend_name.clone()
+                        let (start_idx, end_idx) = view.range;
+                        let points_slice = if start_idx < series.points.len() {
+                            &series.points[start_idx..end_idx.min(series.points.len())]
                         } else {
-                            String::new()
+                            &[]
                         };
-                        let line = Line::new(line_name, PlotPoints::new(seg.clone()))
-                            .color(line_color)
-                            .width(self.line_width);
-                        plot_ui.line(line);
 
-                        let points =
-                            Points::new(String::new(), PlotPoints::new(seg.clone()))
-                                .color(marker_color)
-                                .radius(self.marker_radius)
-                                .shape(marker_shape);
-                        plot_ui.points(points);
+                        // Latest value for legend display name
+                        let latest_value = points_slice.iter().rev().find_map(|(_, y)| *y);
+                        let legend_name = match latest_value {
+                            Some(v) => {
+                                let display_val = if is_log_scale {
+                                    let s = format!("{:.6e}", v);
+                                    if let Some(e_pos) = s.find('e') {
+                                        let (mantissa, exp) = s.split_at(e_pos);
+                                        let trimmed = mantissa
+                                            .trim_end_matches('0')
+                                            .trim_end_matches('.');
+                                        format!("{}{}", trimmed, exp)
+                                    } else {
+                                        s
+                                    }
+                                } else {
+                                    let s = format!("{:.6}", v);
+                                    s.trim_end_matches('0').trim_end_matches('.').to_string()
+                                };
+                                format!("{} : {}({})", series.name, display_val, y_unit)
+                            }
+                            None => series.name.clone(),
+                        };
+
+                        // Build line segments, skipping None values (line breaks)
+                        let mut segments: Vec<Vec<[f64; 2]>> = Vec::new();
+                        let mut current_segment: Vec<[f64; 2]> = Vec::new();
+
+                        for &(x, y_opt) in points_slice {
+                            match y_opt {
+                                Some(y) => {
+                                    let y_render = if is_log_scale {
+                                        if y > 0.0 { y.log10() } else { continue; }
+                                    } else {
+                                        y
+                                    };
+                                    current_segment.push([x + view.offset, y_render]);
+                                }
+                                None => {
+                                    if !current_segment.is_empty() {
+                                        segments.push(std::mem::take(&mut current_segment));
+                                    }
+                                }
+                            }
+                        }
+                        if !current_segment.is_empty() {
+                            segments.push(current_segment);
+                        }
+
+                        let color_idx = i % self.colors.len();
+                        let [r, g, b] = self.colors[color_idx];
+                        let line_color = egui::Color32::from_rgb(r, g, b);
+                        let marker_color =
+                            egui::Color32::from_rgba_unmultiplied(r, g, b, 204);
+                        let marker_shape = MARKER_SHAPES[i % MARKER_SHAPES.len()];
+
+                        for (seg_idx, seg) in segments.iter().enumerate() {
+                            let line_name = if seg_idx == 0 {
+                                legend_name.clone()
+                            } else {
+                                String::new()
+                            };
+                            let line = Line::new(line_name, PlotPoints::new(seg.clone()))
+                                .color(line_color)
+                                .width(self.line_width);
+                            plot_ui.line(line);
+
+                            let points =
+                                Points::new(String::new(), PlotPoints::new(seg.clone()))
+                                    .color(marker_color)
+                                    .radius(self.marker_radius)
+                                    .shape(marker_shape);
+                            plot_ui.points(points);
+                        }
                     }
                 }
             });
@@ -401,10 +462,10 @@ impl eframe::App for PlotApp {
                     let hover = crate::tooltip::find_hover(
                         hover_pos,
                         &response.transform,
-                        &self.data.series,
+                        &self.data,
+                        &views,
                         &self.series_visible,
                         &self.colors,
-                        render_range,
                         is_log_scale,
                         400.0, // 20px squared
                     );
@@ -422,17 +483,79 @@ impl eframe::App for PlotApp {
             }
 
             // --- Custom legend ---
+            let mut legend_entries: Vec<LegendEntry> = Vec::new();
+            for (gi, group) in self.data.groups.iter().enumerate() {
+                let view = views.get(gi).copied().flatten();
+                for series in &group.series {
+                    let latest = view.and_then(|v| {
+                        let start = v.range.0.min(series.points.len());
+                        let end = v.range.1.min(series.points.len());
+                        series.points[start..end].iter().rev().find_map(|(_, y)| *y)
+                    });
+                    legend_entries.push(LegendEntry {
+                        name: series.name.clone(),
+                        color: self.colors[legend_entries.len() % self.colors.len()],
+                        latest,
+                    });
+                }
+            }
             crate::custom_legend::render_legend(
                 ui.ctx(),
                 frame_rect,
                 self.toolbar.legend_pos,
-                &self.data.series,
+                &legend_entries,
                 &mut self.series_visible,
-                &self.colors,
-                render_range,
                 &self.y_unit,
                 is_log_scale,
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dedupe_series_names;
+
+    fn to_groups(v: &[&[&str]]) -> Vec<Vec<String>> {
+        v.iter()
+            .map(|g| g.iter().map(|s| s.to_string()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn inherited_names_get_numbered_suffixes() {
+        let mut g = to_groups(&[&["Temp", "Pres"], &["Temp", "Pres"], &["Temp"]]);
+        dedupe_series_names(&mut g);
+        assert_eq!(g[0], vec!["Temp", "Pres"]);
+        assert_eq!(g[1], vec!["Temp(2)", "Pres(2)"]);
+        assert_eq!(g[2], vec!["Temp(3)"]);
+    }
+
+    #[test]
+    fn unique_names_stay_untouched() {
+        let mut g = to_groups(&[&["A", "B"], &["C"]]);
+        dedupe_series_names(&mut g);
+        assert_eq!(g[0], vec!["A", "B"]);
+        assert_eq!(g[1], vec!["C"]);
+    }
+
+    #[test]
+    fn duplicates_within_one_group_are_suffixed_too() {
+        let mut g = to_groups(&[&["A", "A", "A"]]);
+        dedupe_series_names(&mut g);
+        assert_eq!(g[0], vec!["A", "A(2)", "A(3)"]);
+    }
+
+    #[test]
+    fn suffix_collision_with_explicit_name_keeps_bumping() {
+        let mut g = to_groups(&[&["A", "A", "A(2)"]]);
+        dedupe_series_names(&mut g);
+        // Second "A" takes "A(2)" first; the literal "A(2)" then bumps.
+        assert_eq!(g[0][0], "A");
+        assert_eq!(g[0][1], "A(2)");
+        assert_eq!(g[0][2], "A(2)(2)");
+        // All unique regardless of spelling
+        let set: std::collections::HashSet<_> = g[0].iter().collect();
+        assert_eq!(set.len(), 3);
     }
 }

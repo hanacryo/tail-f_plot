@@ -3,7 +3,7 @@ use egui::text::LayoutJob;
 use egui::{Color32, FontFamily, FontId, Rect, StrokeKind, TextFormat, Ui};
 use egui_plot::{PlotPoint, PlotTransform};
 
-use crate::plot_state::SeriesData;
+use crate::plot_state::{GroupView, PlotData};
 
 /// One series' value at the hovered row.
 pub struct SeriesValue {
@@ -28,19 +28,58 @@ pub struct HoverResult {
     pub values: Vec<SeriesValue>,
 }
 
+/// Nearest row (by stored x) to `raw_target` within `range`, on a group's
+/// row-aligned point buffer. None when the range holds no rows.
+fn nearest_row(points: &[(f64, Option<f64>)], range: (usize, usize), raw_target: f64) -> Option<usize> {
+    let start = range.0.min(points.len());
+    let end = range.1.min(points.len());
+    if start >= end {
+        return None;
+    }
+    let idx = points[start..end].partition_point(|(x, _)| *x < raw_target) + start;
+    Some(if idx >= end {
+        end - 1
+    } else if idx <= start {
+        start
+    } else {
+        let x_lo = points[idx - 1].0;
+        let x_hi = points[idx].0;
+        if (raw_target - x_lo).abs() <= (x_hi - raw_target).abs() {
+            idx - 1
+        } else {
+            idx
+        }
+    })
+}
+
+/// Whether `raw_target` lies within the plotted x extent of a group's visible
+/// range. Outside it no line exists (the file's recording ended earlier, or
+/// starts later), so no value should be reported there.
+fn extent_contains(points: &[(f64, Option<f64>)], range: (usize, usize), raw_target: f64) -> bool {
+    let start = range.0.min(points.len());
+    let end = range.1.min(points.len());
+    if start >= end {
+        return false;
+    }
+    raw_target >= points[start].0 && raw_target <= points[end - 1].0
+}
+
 /// Detect the hovered data row and collect every visible series' value on it.
 ///
-/// All series are row-aligned (every `push_row` appends to all series), so a
-/// single row index yields one shared X and one Y per series. The row is
-/// chosen by point-snap when the cursor is within `interact_radius_sq` of a
-/// plotted point, otherwise by nearest X to the cursor.
+/// Series within a file group are row-aligned, so one row index per group
+/// yields one X and one Y per series of that group. The anchor row is chosen
+/// by point-snap when the cursor is within `interact_radius_sq` of a plotted
+/// point, otherwise by nearest display X to the cursor across all groups;
+/// every other group then contributes its own row nearest to that X.
+/// `views` carries each group's visible index range and display offset
+/// (None = the group is not renderable yet).
 pub fn find_hover(
     hover_pos: egui::Pos2,
     transform: &PlotTransform,
-    series: &[SeriesData],
+    data: &PlotData,
+    views: &[Option<GroupView>],
     series_visible: &[bool],
     colors: &[[u8; 3]],
-    render_range: Option<(usize, usize)>,
     is_log_scale: bool,
     interact_radius_sq: f32,
 ) -> HoverResult {
@@ -60,92 +99,117 @@ pub fn find_hover(
         values: Vec::new(),
     };
 
-    if series.is_empty() {
-        return no_data;
-    }
-    let total = series[0].points.len();
-    let (start_idx, end_idx) = render_range.unwrap_or((0, total));
-    let start_idx = start_idx.min(total);
-    let end_idx = end_idx.min(total);
-    if start_idx >= end_idx {
-        return no_data;
-    }
-
-    // Binary search for the cursor's X within the visible range.
-    let hv_idx = series[0].points[start_idx..end_idx]
-        .partition_point(|(x, _)| *x < hover_value.x)
-        + start_idx;
-
     // --- Snap detection: closest visible plotted point within radius ---
-    let check_start = hv_idx.saturating_sub(5).max(start_idx);
-    let check_end = (hv_idx + 5).min(end_idx);
-    // (row_idx, raw_y, dist_sq, screen_pos)
-    let mut snap: Option<(usize, f64, f32, egui::Pos2)> = None;
+    // (group_idx, row_idx, raw_y, dist_sq, screen_pos)
+    let mut snap: Option<(usize, usize, f64, f32, egui::Pos2)> = None;
+    let mut flat_base = 0usize;
 
-    for (i, s) in series.iter().enumerate() {
-        if !series_visible.get(i).copied().unwrap_or(true) {
+    for (gi, group) in data.groups.iter().enumerate() {
+        let base = flat_base;
+        flat_base += group.series.len();
+
+        let Some(view) = views.get(gi).copied().flatten() else { continue };
+        let Some(first) = group.series.first() else { continue };
+        let start_idx = view.range.0.min(first.points.len());
+        let end_idx = view.range.1.min(first.points.len());
+        if start_idx >= end_idx {
             continue;
         }
-        for j in check_start..check_end {
-            let (x, y_opt) = s.points[j];
-            if let Some(y) = y_opt {
-                let y_render = if is_log_scale {
-                    if y > 0.0 {
-                        y.log10()
+
+        // Binary search for the cursor's X within the visible range.
+        let raw_cursor = hover_value.x - view.offset;
+        let hv_idx = first.points[start_idx..end_idx]
+            .partition_point(|(x, _)| *x < raw_cursor)
+            + start_idx;
+        let check_start = hv_idx.saturating_sub(5).max(start_idx);
+        let check_end = (hv_idx + 5).min(end_idx);
+
+        for (si, s) in group.series.iter().enumerate() {
+            if !series_visible.get(base + si).copied().unwrap_or(true) {
+                continue;
+            }
+            for j in check_start..check_end {
+                let (x, y_opt) = s.points[j];
+                if let Some(y) = y_opt {
+                    let y_render = if is_log_scale {
+                        if y > 0.0 {
+                            y.log10()
+                        } else {
+                            continue;
+                        }
                     } else {
-                        continue;
+                        y
+                    };
+                    let pt = PlotPoint::new(x + view.offset, y_render);
+                    let screen_pos = transform.position_from_point(&pt);
+                    let dist_sq = hover_pos.distance_sq(screen_pos);
+                    if dist_sq <= interact_radius_sq
+                        && snap.as_ref().map_or(true, |(_, _, _, d, _)| dist_sq < *d)
+                    {
+                        snap = Some((gi, j, y, dist_sq, screen_pos));
                     }
-                } else {
-                    y
-                };
-                let pt = PlotPoint::new(x, y_render);
-                let screen_pos = transform.position_from_point(&pt);
-                let dist_sq = hover_pos.distance_sq(screen_pos);
-                if dist_sq <= interact_radius_sq
-                    && snap.as_ref().map_or(true, |(_, _, d, _)| dist_sq < *d)
-                {
-                    snap = Some((j, y, dist_sq, screen_pos));
                 }
             }
         }
     }
 
-    // --- Pick the target row, anchor, and the row-2 pointer Y ---
+    // --- Pick the target display X, anchor, and the row-2 pointer Y ---
     // When snapped, both the anchor (crosshair / tooltip) and the row-2 `y`
     // follow the snapped point rather than the free cursor.
-    let (row_idx, anchor, pointer_y) = if let Some((idx, snap_y, _, pos)) = snap {
-        (idx, pos, snap_y)
+    let (target_x, anchor, pointer_y) = if let Some((gi, j, snap_y, _, pos)) = snap {
+        let view = views[gi].expect("snapped group has a view");
+        (data.groups[gi].series[0].points[j].0 + view.offset, pos, snap_y)
     } else {
-        // Not snapped: nearest row by X to the cursor.
-        let idx = if hv_idx >= end_idx {
-            end_idx - 1
-        } else if hv_idx <= start_idx {
-            start_idx
-        } else {
-            let x_lo = series[0].points[hv_idx - 1].0;
-            let x_hi = series[0].points[hv_idx].0;
-            if (hover_value.x - x_lo).abs() <= (x_hi - hover_value.x).abs() {
-                hv_idx - 1
-            } else {
-                hv_idx
+        // Not snapped: nearest row by display X to the cursor, across groups.
+        let mut best_x: Option<f64> = None;
+        for (gi, group) in data.groups.iter().enumerate() {
+            let Some(view) = views.get(gi).copied().flatten() else { continue };
+            let Some(first) = group.series.first() else { continue };
+            let Some(row) = nearest_row(&first.points, view.range, hover_value.x - view.offset)
+            else {
+                continue;
+            };
+            let dx = first.points[row].0 + view.offset;
+            if best_x.map_or(true, |b| (dx - hover_value.x).abs() < (b - hover_value.x).abs()) {
+                best_x = Some(dx);
             }
-        };
-        (idx, hover_pos, cursor_y)
+        }
+        match best_x {
+            Some(x) => (x, hover_pos, cursor_y),
+            None => return no_data,
+        }
     };
 
-    // Collect every visible series' value at the row, in legend order.
-    let x = series[0].points[row_idx].0;
+    // Collect every visible series' value at each group's row nearest to the
+    // target X, in legend order.
     let mut values = Vec::new();
-    for (i, s) in series.iter().enumerate() {
-        if !series_visible.get(i).copied().unwrap_or(true) {
+    let mut flat_base = 0usize;
+    for (gi, group) in data.groups.iter().enumerate() {
+        let base = flat_base;
+        flat_base += group.series.len();
+
+        let Some(view) = views.get(gi).copied().flatten() else { continue };
+        let Some(first) = group.series.first() else { continue };
+        let raw_target = target_x - view.offset;
+        let Some(row) = nearest_row(&first.points, view.range, raw_target) else {
+            continue;
+        };
+        // Showing a nearest-row value where the group draws no line would be
+        // misleading — skip the group entirely.
+        if !extent_contains(&first.points, view.range, raw_target) {
             continue;
         }
-        if let Some((_, Some(y))) = s.points.get(row_idx).copied() {
-            values.push(SeriesValue {
-                name: s.name.clone(),
-                color: colors[i % colors.len()],
-                y,
-            });
+        for (si, s) in group.series.iter().enumerate() {
+            if !series_visible.get(base + si).copied().unwrap_or(true) {
+                continue;
+            }
+            if let Some((_, Some(y))) = s.points.get(row).copied() {
+                values.push(SeriesValue {
+                    name: s.name.clone(),
+                    color: colors[(base + si) % colors.len()],
+                    y,
+                });
+            }
         }
     }
     // Larger values first; `sort_by` is stable so ties keep legend order.
@@ -154,7 +218,7 @@ pub fn find_hover(
     });
 
     HoverResult {
-        x,
+        x: target_x,
         pointer_y,
         anchor,
         values,
@@ -385,6 +449,53 @@ fn format_x_parts(x: f64, x_proportion: f64, unit: &str) -> Vec<(String, bool)> 
             (s, true),
             (format!(" ({})", unit), false),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extent_contains, nearest_row};
+
+    fn pts(xs: &[f64]) -> Vec<(f64, Option<f64>)> {
+        xs.iter().map(|&x| (x, Some(1.0))).collect()
+    }
+
+    #[test]
+    fn extent_excludes_before_start_and_after_end() {
+        let p = pts(&[10.0, 20.0, 30.0]);
+        assert!(!extent_contains(&p, (0, 3), 9.9));   // before the first row
+        assert!(extent_contains(&p, (0, 3), 10.0));   // boundary inclusive
+        assert!(extent_contains(&p, (0, 3), 25.0));
+        assert!(extent_contains(&p, (0, 3), 30.0));   // boundary inclusive
+        assert!(!extent_contains(&p, (0, 3), 30.1));  // after the last row
+    }
+
+    #[test]
+    fn extent_follows_visible_range_not_full_data() {
+        let p = pts(&[0.0, 10.0, 20.0, 30.0]);
+        // Only rows [1..3) visible: extent is [10, 20]
+        assert!(!extent_contains(&p, (1, 3), 5.0));
+        assert!(extent_contains(&p, (1, 3), 15.0));
+        assert!(!extent_contains(&p, (1, 3), 25.0));
+        // Empty range → nothing plotted
+        assert!(!extent_contains(&p, (2, 2), 20.0));
+    }
+
+    #[test]
+    fn nearest_row_picks_closer_neighbor() {
+        let p = pts(&[0.0, 10.0, 20.0]);
+        assert_eq!(nearest_row(&p, (0, 3), 4.0), Some(0));
+        assert_eq!(nearest_row(&p, (0, 3), 6.0), Some(1));
+        assert_eq!(nearest_row(&p, (0, 3), 100.0), Some(2));
+        assert_eq!(nearest_row(&p, (0, 3), -100.0), Some(0));
+    }
+
+    #[test]
+    fn nearest_row_respects_range() {
+        let p = pts(&[0.0, 10.0, 20.0, 30.0]);
+        assert_eq!(nearest_row(&p, (2, 4), 0.0), Some(2));
+        assert_eq!(nearest_row(&p, (2, 2), 0.0), None);
+        assert_eq!(nearest_row(&p, (5, 9), 0.0), None); // clamped past end
     }
 }
 

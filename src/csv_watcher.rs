@@ -5,6 +5,7 @@ use std::sync::mpsc;
 
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
+use crate::groups::GroupConfig;
 use crate::plot_state::PlotData;
 
 pub struct CsvWatcher {
@@ -22,36 +23,29 @@ pub struct CsvWatcher {
     string_quote: Option<char>,
     merge_delimiter: bool,
     x_proportion: f64,
+    epoch_col: Option<usize>, // 0-based
+    epoch_proportion: f64,
 }
 
 impl CsvWatcher {
-    pub fn new(
-        path: PathBuf,
-        x_col_1based: usize,
-        y_cols_1based: &[usize],
-        _header_row: usize,
-        data_start_row: usize,
-        delimiter: String,
-        fixed_widths: Vec<usize>,
-        string_quote: Option<char>,
-        merge_delimiter: bool,
-        x_proportion: f64,
-    ) -> Self {
+    pub fn new(cfg: &GroupConfig) -> Self {
         Self {
-            path,
-            x_col: x_col_1based.saturating_sub(1),
-            y_cols: y_cols_1based.iter().map(|c| c.saturating_sub(1)).collect(),
-            data_start_row,
+            path: cfg.csv_path.clone(),
+            x_col: cfg.x_col.saturating_sub(1),
+            y_cols: cfg.y_cols.iter().map(|c| c.saturating_sub(1)).collect(),
+            data_start_row: cfg.data_start_row,
             reader: None,
             current_line: 1,
             incomplete_buf: String::new(),
             _watcher: None,
             notify_rx: None,
-            delimiter,
-            fixed_widths,
-            string_quote,
-            merge_delimiter,
-            x_proportion,
+            delimiter: cfg.delimiter.clone(),
+            fixed_widths: cfg.fixed_width.clone(),
+            string_quote: cfg.string_quote,
+            merge_delimiter: cfg.merge_delimiter,
+            x_proportion: cfg.x_proportion,
+            epoch_col: cfg.epochtime_col.checked_sub(1),
+            epoch_proportion: cfg.epoch_proportion(),
         }
     }
 
@@ -66,8 +60,9 @@ impl CsvWatcher {
         self.notify_rx = Some(rx);
     }
 
-    /// Poll for new data. Returns true if any new rows were added.
-    pub fn poll(&mut self, data: &mut PlotData) -> bool {
+    /// Poll for new data, pushing rows into `data`'s group `group_idx`.
+    /// Returns true if any new rows were added.
+    pub fn poll(&mut self, data: &mut PlotData, group_idx: usize) -> bool {
         // Drain notify events
         if let Some(rx) = &self.notify_rx {
             while rx.try_recv().is_ok() {}
@@ -135,8 +130,8 @@ impl CsvWatcher {
             eprintln!("[CsvWatcher] {} new row(s) found", rows_to_parse.len());
         }
         for row in &rows_to_parse {
-            if let Some((x, ys)) = self.parse_row(row) {
-                data.push_row(x, &ys);
+            if let Some((x, epoch, ys)) = self.parse_row(row) {
+                data.push_row(group_idx, x, epoch, &ys);
                 added = true;
             }
         }
@@ -144,7 +139,7 @@ impl CsvWatcher {
         added
     }
 
-    fn parse_row(&self, line: &str) -> Option<(f64, Vec<Option<f64>>)> {
+    fn parse_row(&self, line: &str) -> Option<(f64, Option<f64>, Vec<Option<f64>>)> {
         let fields: Vec<&str> = if !self.fixed_widths.is_empty() {
             // Fixed-width mode
             let mut result = Vec::new();
@@ -181,6 +176,17 @@ impl CsvWatcher {
         let x: f64 = x_str.parse().ok()?;
         let x = x * self.x_proportion;
 
+        // Epoch-time column: a row whose epoch cell is missing or invalid is
+        // still plotted; the epoch anchor just waits for the first valid one.
+        let epoch = self.epoch_col.and_then(|col| {
+            let s = fields.get(col)?.trim();
+            let s = match quote {
+                Some(q) => s.trim_matches(q),
+                None => s,
+            };
+            s.parse::<f64>().ok().map(|v| v * self.epoch_proportion)
+        });
+
         let ys: Vec<Option<f64>> = self.y_cols
             .iter()
             .map(|&col| {
@@ -202,6 +208,6 @@ impl CsvWatcher {
             })
             .collect();
 
-        Some((x, ys))
+        Some((x, epoch, ys))
     }
 }

@@ -8,7 +8,10 @@ pub enum PlotMode {
 /// Per-series data buffer.
 pub struct SeriesData {
     pub name: String,
-    /// (x_minutes, y_value) pairs. y_value is None when the cell was empty.
+    /// (x, y_value) pairs. `x` is the raw column value with x-proportion
+    /// applied but before any origin/epoch offset — offsets are applied at
+    /// render time (see `PlotData::offset`). y_value is None when the cell
+    /// was empty.
     pub points: Vec<(f64, Option<f64>)>,
 }
 
@@ -21,105 +24,266 @@ impl SeriesData {
     }
 }
 
-pub struct PlotData {
+/// All series read from one watched file. Series within a group are
+/// row-aligned (every `push_row` appends to all of them).
+pub struct FileGroup {
     pub series: Vec<SeriesData>,
-    /// The epoch value of the very first data row (used as X origin).
-    pub epoch_origin: Option<f64>,
+    /// Scaled x of the very first data row (origin for relative-x display).
+    pub origin_x: Option<f64>,
+    /// (scaled x, scaled epoch) of the first row whose epoch column parsed.
+    pub epoch_anchor: Option<(f64, f64)>,
+    /// Whether this group has an epoch-time column configured.
+    epoch_expected: bool,
+}
+
+/// Per-group render info: the visible index range on the group's row-aligned
+/// point buffers, plus the constant display offset added to stored x values.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GroupView {
+    pub range: (usize, usize),
+    pub offset: f64,
+}
+
+pub struct PlotData {
+    pub groups: Vec<FileGroup>,
     /// If true, use raw X values without origin subtraction
     absolute_x: bool,
 }
 
 impl PlotData {
-    pub fn new(names: &[String], absolute_x: bool) -> Self {
+    pub fn new(absolute_x: bool) -> Self {
         Self {
-            series: names.iter().map(|n| SeriesData::new(n.clone())).collect(),
-            epoch_origin: None,
+            groups: Vec::new(),
             absolute_x,
         }
     }
 
-    /// Push one row of data. `x_value` has x_proportion already applied.
-    /// If absolute_x is false, the first row's x is subtracted as origin.
-    pub fn push_row(&mut self, x_value: f64, y_values: &[Option<f64>]) {
-        let x = if self.absolute_x {
-            x_value
-        } else {
-            if self.epoch_origin.is_none() {
-                self.epoch_origin = Some(x_value);
-            }
-            x_value - self.epoch_origin.unwrap()
-        };
+    pub fn add_group(&mut self, names: &[String], epoch_expected: bool) {
+        self.groups.push(FileGroup {
+            series: names.iter().map(|n| SeriesData::new(n.clone())).collect(),
+            origin_x: None,
+            epoch_anchor: None,
+            epoch_expected,
+        });
+    }
 
-        for (i, series) in self.series.iter_mut().enumerate() {
+    pub fn series_count(&self) -> usize {
+        self.groups.iter().map(|g| g.series.len()).sum()
+    }
+
+    /// Push one row into a group. `x` and `epoch` have their proportions
+    /// already applied.
+    pub fn push_row(&mut self, group: usize, x: f64, epoch: Option<f64>, y_values: &[Option<f64>]) {
+        let g = &mut self.groups[group];
+        if g.origin_x.is_none() {
+            g.origin_x = Some(x);
+        }
+        if g.epoch_expected && g.epoch_anchor.is_none() {
+            if let Some(e) = epoch {
+                g.epoch_anchor = Some((x, e));
+            }
+        }
+        for (i, series) in g.series.iter_mut().enumerate() {
             let y = y_values.get(i).copied().flatten();
             series.points.push((x, y));
         }
     }
 
-    /// Compute render range based on max points and max time.
-    /// Returns None if no data.
-    pub fn get_render_range(&self, max_points: usize, max_time_minutes: f64) -> Option<(usize, usize)> {
-        if self.series.is_empty() {
-            return None;
+    /// Display offset for a group, or None while it cannot be resolved yet
+    /// (data keeps accumulating; the group renders once resolvable).
+    ///
+    /// - `--absolute-x`: always 0 (epoch alignment unused).
+    /// - Otherwise the first group's first row is the shared origin: every
+    ///   group is shifted by `-origin_x(first group)`.
+    /// - A later group with an epoch column configured — and the first group's
+    ///   too — is instead shifted so equal epoch values land on equal display
+    ///   x, aligning files whose recordings started at different times.
+    pub fn offset(&self, group: usize) -> Option<f64> {
+        if self.absolute_x {
+            return Some(0.0);
         }
-        let total = self.series[0].points.len();
-        if total == 0 {
-            return None;
+        let g0 = self.groups.first()?;
+        let origin0 = g0.origin_x?;
+        if group == 0 {
+            return Some(-origin0);
         }
-
-        // Time-based start index
-        let last_x = self.series[0].points.last().map(|(x, _)| *x).unwrap_or(0.0);
-        let time_start_x = last_x - max_time_minutes;
-
-        // Binary search for time-based start index
-        let time_start_idx = self.series[0]
-            .points
-            .partition_point(|(x, _)| *x < time_start_x);
-
-        // Point-count-based start index
-        let points_start_idx = if total > max_points {
-            total - max_points
+        let gk = self.groups.get(group)?;
+        if gk.epoch_expected && g0.epoch_expected {
+            // Wait for both anchors so the group doesn't jump from the
+            // shared-origin position to the epoch-aligned one mid-flight.
+            let (ax_k, ae_k) = gk.epoch_anchor?;
+            let (ax_0, ae_0) = g0.epoch_anchor?;
+            // A row of group k at wall time T must land where group 0 would
+            // plot its own row at T:
+            //   display = (x - ax_k) + (ae_k - ae_0) + (ax_0 - origin0)
+            Some((ae_k - ae_0) - ax_k + ax_0 - origin0)
         } else {
-            0
-        };
-
-        // Use the larger (renders fewer points)
-        let start_idx = time_start_idx.max(points_start_idx);
-        Some((start_idx, total))
+            Some(-origin0)
+        }
     }
 
-    /// Compute X/Y bounds across all series. Only valid values included.
-    /// Returns None if no data.
-    /// Unused for now, but may be useful for auto-scaling in the future.
-    pub fn _get_bounds(&self) -> Option<(f64, f64, f64, f64)> {
-        let mut x_min = f64::MAX;
-        let mut x_max = f64::MIN;
-        let mut y_min = f64::MAX;
-        let mut y_max = f64::MIN;
-        let mut has_data = false;
+    /// Compute per-group render views honoring max_points / max_x_range
+    /// (the stricter of the two applies, per group). The x-range window is
+    /// anchored at the latest display x across all resolvable groups.
+    /// None = the group's offset is not resolvable yet.
+    pub fn views(&self, max_points: usize, max_x_range: f64) -> Vec<Option<GroupView>> {
+        let offsets: Vec<Option<f64>> = (0..self.groups.len()).map(|k| self.offset(k)).collect();
 
-        for series in &self.series {
-            for &(x, y_opt) in &series.points {
-                if let Some(y) = y_opt {
-                    has_data = true;
-                    x_min = x_min.min(x);
-                    x_max = x_max.max(x);
-                    y_min = y_min.min(y);
-                    y_max = y_max.max(y);
-                }
+        let mut last_display: Option<f64> = None;
+        for (g, off) in self.groups.iter().zip(&offsets) {
+            if let (Some(off), Some(&(x, _))) =
+                (off, g.series.first().and_then(|s| s.points.last()))
+            {
+                let d = x + off;
+                last_display = Some(last_display.map_or(d, |v: f64| v.max(d)));
             }
         }
 
-        if has_data {
-            // Add 5% margin
-            let x_margin = (x_max - x_min).abs() * 0.05;
-            let y_margin = (y_max - y_min).abs() * 0.05;
-            // Use default margin if zero
-            let x_margin = if x_margin > 0.0 { x_margin } else { 1.0 };
-            let y_margin = if y_margin > 0.0 { y_margin } else { 1.0 };
-            Some((x_min - x_margin, x_max + x_margin, y_min - y_margin, y_max + y_margin))
-        } else {
-            None
+        self.groups
+            .iter()
+            .zip(&offsets)
+            .map(|(g, off)| {
+                let off = (*off)?;
+                let total = g.series.first().map(|s| s.points.len()).unwrap_or(0);
+                let last = match last_display {
+                    Some(v) if total > 0 => v,
+                    _ => return Some(GroupView { range: (0, 0), offset: off }),
+                };
+
+                // Time-based start index (threshold converted to stored x)
+                let raw_threshold = (last - max_x_range) - off;
+                let time_start = g.series[0]
+                    .points
+                    .partition_point(|(x, _)| *x < raw_threshold);
+
+                // Point-count-based start index
+                let count_start = total.saturating_sub(max_points);
+
+                // Use the larger (renders fewer points)
+                Some(GroupView {
+                    range: (time_start.max(count_start), total),
+                    offset: off,
+                })
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("s{}", i)).collect()
+    }
+
+    #[test]
+    fn shared_origin_from_first_group() {
+        let mut d = PlotData::new(false);
+        d.add_group(&names(1), false);
+        d.add_group(&names(1), false);
+
+        // Unresolved until the first group has data
+        assert_eq!(d.offset(0), None);
+        assert_eq!(d.offset(1), None);
+
+        d.push_row(1, 105.0, None, &[Some(2.0)]);
+        assert_eq!(d.offset(1), None); // still waiting for group 0
+
+        d.push_row(0, 100.0, None, &[Some(1.0)]);
+        assert_eq!(d.offset(0), Some(-100.0));
+        assert_eq!(d.offset(1), Some(-100.0)); // shared origin
+    }
+
+    #[test]
+    fn absolute_x_needs_no_origin() {
+        let mut d = PlotData::new(true);
+        d.add_group(&names(1), true);
+        d.add_group(&names(1), true);
+        assert_eq!(d.offset(0), Some(0.0));
+        assert_eq!(d.offset(1), Some(0.0));
+        d.push_row(1, 50.0, Some(9999.0), &[Some(1.0)]);
+        assert_eq!(d.offset(1), Some(0.0)); // epoch alignment unused
+    }
+
+    #[test]
+    fn epoch_alignment_shifts_by_wall_clock_difference() {
+        let mut d = PlotData::new(false);
+        d.add_group(&names(1), true);
+        d.add_group(&names(1), true);
+
+        // Both files log elapsed x starting at 0; recordings 30 units apart.
+        d.push_row(0, 0.0, Some(1000.0), &[Some(1.0)]);
+        d.push_row(1, 0.0, Some(1030.0), &[Some(2.0)]);
+
+        assert_eq!(d.offset(0), Some(0.0));
+        assert_eq!(d.offset(1), Some(30.0));
+    }
+
+    #[test]
+    fn epoch_alignment_waits_for_anchor() {
+        let mut d = PlotData::new(false);
+        d.add_group(&names(1), true);
+        d.add_group(&names(1), true);
+
+        d.push_row(0, 0.0, Some(1000.0), &[Some(1.0)]);
+        // Group 1 rows whose epoch cell failed to parse: buffered, unresolved.
+        d.push_row(1, 0.0, None, &[Some(2.0)]);
+        assert_eq!(d.offset(1), None);
+
+        // Anchor pairs the first valid epoch with that row's x.
+        d.push_row(1, 5.0, Some(1035.0), &[Some(3.0)]);
+        assert_eq!(d.offset(1), Some(30.0));
+    }
+
+    #[test]
+    fn epoch_falls_back_to_shared_origin_without_first_group_column() {
+        let mut d = PlotData::new(false);
+        d.add_group(&names(1), false); // first file has no epoch column
+        d.add_group(&names(1), true);
+
+        d.push_row(0, 100.0, None, &[Some(1.0)]);
+        d.push_row(1, 200.0, Some(1030.0), &[Some(2.0)]);
+        assert_eq!(d.offset(1), Some(-100.0));
+    }
+
+    #[test]
+    fn views_window_anchored_at_global_latest() {
+        let mut d = PlotData::new(true);
+        d.add_group(&names(1), false);
+        d.add_group(&names(1), false);
+
+        for x in 0..10 {
+            d.push_row(0, x as f64, None, &[Some(1.0)]);
         }
+        d.push_row(1, 100.0, None, &[Some(2.0)]);
+
+        // Window = [100 - 5, 100]: group 0 entirely outside, group 1 inside.
+        let views = d.views(1000, 5.0);
+        assert_eq!(views[0].unwrap().range, (10, 10));
+        assert_eq!(views[1].unwrap().range, (0, 1));
+    }
+
+    #[test]
+    fn views_max_points_applies_per_group() {
+        let mut d = PlotData::new(true);
+        d.add_group(&names(1), false);
+        for x in 0..10 {
+            d.push_row(0, x as f64, None, &[Some(1.0)]);
+        }
+        let views = d.views(3, 1e9);
+        assert_eq!(views[0].unwrap().range, (7, 10));
+    }
+
+    #[test]
+    fn unresolved_group_has_no_view() {
+        let mut d = PlotData::new(false);
+        d.add_group(&names(1), false);
+        d.add_group(&names(1), false);
+        d.push_row(1, 5.0, None, &[Some(1.0)]);
+
+        let views = d.views(1000, 1e9);
+        assert!(views[0].is_none());
+        assert!(views[1].is_none());
     }
 }

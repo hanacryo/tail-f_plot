@@ -11,6 +11,7 @@ Built with [egui](https://github.com/emilk/egui) and [egui_plot](https://github.
 - **Live tail**: Watches the file via OS notifications and redraws automatically.
 - **Flexible CSV parsing**: Configurable delimiter (comma, tab, semicolon, space, pipe), quoted fields, merged delimiters, fixed-width columns.
 - **Multiple Y series**: Plot any combination of columns on a single chart.
+- **Multiple files**: Overlay several files on the same axes with `--` separators, including epoch-time alignment for recordings that started at different times.
 - **Interactive zoom/pan**: Scroll-wheel zoom, drag pan, box zoom-in, click zoom-out.
 - **Log scale**: Toggle Y-axis log scale at runtime.
 - **Multi-monitor DPI aware**: Per-monitor DPI v2 support with work-area-percentage window placement.
@@ -51,12 +52,18 @@ tail-f_plot.exe data.tsv --delimiter tab --y-cols 2,3
 
 # Log scale, specific monitor, window placement
 tail-f_plot.exe data.csv --y-cols 5 --log-y --monitor 1 --bounds 0,0,50,100
+
+# Two files on the same axes (b.csv inherits a.csv's options)
+tail-f_plot.exe a.csv --y-cols 2 -- b.csv
+
+# Aligned by epoch time even though recordings started at different times
+tail-f_plot.exe a.csv --y-cols 2 --epochtime-col 5 -- b.csv
 ```
 
 ## Usage
 
 ```
-tail-f_plot.exe <CSV_PATH> [OPTIONS]
+tail-f_plot.exe <CSV_PATH> [OPTIONS] [-- [CSV_PATH] [OPTIONS] ...]
 ```
 
 ### Launching
@@ -99,7 +106,7 @@ On successful launch, two lines are printed to stdout and then **no further outp
 
 | First line prefix | Meaning | Exit code |
 |-------------------|---------|-----------|
-| `PID: ` | Launched successfully. Second line is `WATCHING: <path>` (file exists) or `WAITING: <path>` (file not yet created). | — |
+| `PID: ` | Launched successfully. Each following line is `WATCHING: <path>` (file exists) or `WAITING: <path>` (file not yet created) — one per watched file. | — |
 | `HANA ` | Help text displayed (no args, or `--help`). | 0 or 1 |
 | `EXCEPTION: ` | Invalid arguments. Error detail follows. | 1 |
 
@@ -132,8 +139,10 @@ On successful launch, two lines are printed to stdout and then **no further outp
 |--------|---------|-------------|
 | `--delimiter <NAME>` | `comma` | `comma`, `tab`, `semicolon`, `space`, `vbar` |
 | `--string-quote <NAME>` | `none` | `none`, `squote`, `dquote`, `backtick` |
-| `--merge-delimiter` | `false` | Treat consecutive delimiters as one |
+| `--merge-delimiter` | `false` | Treat consecutive delimiters as one (`--merge-delimiter=false` to disable) |
 | `--fixed-width <N,N,...>` | | Fixed-width column widths (overrides delimiter) |
+| `--epochtime-col <N>` | `0` (off) | Epoch-time column (1-based) for multi-file alignment |
+| `--epochtime-proportion <F>` | `--x-proportion` | Multiplier applied to the epoch-time column |
 
 ### Rendering Options
 
@@ -150,7 +159,37 @@ On successful launch, two lines are printed to stdout and then **no further outp
 | `--max-x-range <F>` | `120.0` | Max visible X range after proportion (see note below) |
 | `--marker-radius <F>` | `4.0` | Data point marker radius |
 
-> **`--max-points` / `--max-x-range`:** Both limit the visible window. The stricter of the two applies.
+> **`--max-points` / `--max-x-range`:** Both limit the visible window. The stricter of the two applies (per file in multi-file mode).
+
+## Multiple Files
+
+`--` starts a new *file group* plotted on the same axes:
+
+```
+tail-f_plot.exe a.csv --y-cols 2,3 -- b.csv --y-cols 2 -- c.csv
+```
+
+**Inheritance** — options omitted in a group (even the file path) inherit from the previous group; options given apply to that group and are inherited onward. In the example above `c.csv` uses `--y-cols 2` from the `b.csv` group. A fully empty group (e.g. a trailing `--`) is ignored.
+
+**Per-group options**: `<CSV_PATH>`, `--x-col`, `--y-cols`, `--y-names`, `--header-row`, `--data-start-row`, `--delimiter`, `--string-quote`, `--merge-delimiter`, `--fixed-width`, `--x-time-scale`, `--x-proportion`, `--epochtime-col`, `--epochtime-proportion`. All other options are window-global and belong to the first group only — using one after `--` is an error.
+
+**Resetting an inherited option**: `--epochtime-col 0` (disable), `--fixed-width 0` (back to delimiter mode), `--merge-delimiter=false`.
+
+**X units per file** — each group's `--x-time-scale` / `--x-proportion` scales that file's raw X into the shared display unit. E.g. first file logs seconds, second logs milliseconds:
+
+```
+tail-f_plot.exe a.csv --y-cols 2 -- b.csv --x-proportion 0.0000166666666667
+```
+
+**X offset** — without `--absolute-x`, every file shares the first file's X origin (the first file's first row is display x = 0). This aligns files whose X columns run on the same clock. With `--absolute-x`, all files plot raw scaled X values.
+
+**Epoch-time alignment** — when X columns are *elapsed* times (each file starting at 0), shared origin cannot align them. If the files also log an epoch timestamp, give its column via `--epochtime-col`: each later file is then shifted by the wall-clock difference between its first epoch value and the first file's, so recordings that started at different times align exactly. Requires the epoch column on the first file too (inheritance makes this automatic); files without it fall back to the shared origin. The epoch column is scaled by `--epochtime-proportion` (default: the group's `--x-proportion`) — override it when the epoch unit differs from the X-column unit (e.g. epoch in ms, X in s). Ignored under `--absolute-x`.
+
+> **Notes**
+> - Series colors and marker shapes continue across groups; default legend names get a file-stem prefix (`a:Col2`).
+> - Until the first file produces its first row (and, for epoch alignment, both epoch anchors are known), later files buffer their data and appear once the offset is resolvable.
+> - Duplicate series names (e.g. `--y-names` inherited into a later group) are disambiguated automatically: the second occurrence becomes `Name(2)`, the third `Name(3)`, and so on.
+> - The same file may appear in several groups (e.g. plotting different columns of one file).
 
 ## Keyboard & Mouse
 

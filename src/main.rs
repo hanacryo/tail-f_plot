@@ -6,6 +6,7 @@
 mod app;
 mod csv_watcher;
 mod custom_legend;
+mod groups;
 mod plot_state;
 mod toolbar;
 mod tooltip;
@@ -265,13 +266,23 @@ pub struct Cli {
     #[arg(long, default_value = "none")]
     string_quote: String,
 
-    /// Merge consecutive delimiters into one
-    #[arg(long, default_value_t = false)]
-    merge_delimiter: bool,
+    /// Merge consecutive delimiters into one (`--merge-delimiter=false` to disable)
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    merge_delimiter: Option<bool>,
 
     /// Fixed-width column widths (comma separated). Overrides delimiter when set.
     #[arg(long, value_delimiter = ',')]
     fixed_width: Vec<usize>,
+
+    /// Epoch-time column (1-based) used to align multiple files whose
+    /// recordings started at different times. 0 = disabled.
+    #[arg(long, default_value_t = 0)]
+    epochtime_col: usize,
+
+    /// Proportional constant applied to the epoch-time column
+    /// (default: this file's resolved --x-proportion)
+    #[arg(long)]
+    epochtime_proportion: Option<f64>,
 
     // --- Rendering options ---
 
@@ -349,7 +360,7 @@ fn help_text() -> String {
         "HANA tail-f_plot v{ver}\n\n\
         Real-time CSV plotting tool.\n\n\
         Usage:\n\
-        {exe} <CSV_PATH> [OPTIONS]\n\n\
+        {exe} <CSV_PATH> [OPTIONS] [-- [CSV_PATH] [OPTIONS] ...]\n\n\
         Arguments:\n\
         <CSV_PATH>  CSV file path\n\n\
         Options:\n\
@@ -366,8 +377,10 @@ fn help_text() -> String {
         CSV Parsing:\n\
         --delimiter <NAME>       comma|tab|semicolon|space|vbar [default: comma]\n\
         --string-quote <NAME>    none|squote|dquote|backtick [default: none]\n\
-        --merge-delimiter        Merge consecutive delimiters\n\
-        --fixed-width <N,N,...>  Fixed-width columns (overrides delimiter)\n\n\
+        --merge-delimiter        Merge consecutive delimiters (=false to reset)\n\
+        --fixed-width <N,N,...>  Fixed-width columns (overrides delimiter; 0=reset)\n\
+        --epochtime-col <N>      Epoch-time column for multi-file alignment (0=off)\n\
+        --epochtime-proportion <F>  Epoch scale [default: --x-proportion]\n\n\
         Rendering:\n\
         --repaint-interval-ms <N>  Repaint interval [default: 250]\n\
         --x-axis-label <STR>       X-axis label [default: Time]\n\
@@ -380,9 +393,22 @@ fn help_text() -> String {
         --max-x-range <F>          Max X range [default: 120.0]\n\
           (max-points / max-x-range: stricter of the two applies)\n\
         --marker-radius <F>        Marker radius [default: 4.0]\n\n\
+        Multi-file:\n\
+        `--` starts a new file group plotted on the same axes. Omitted options\n\
+        (even the file path) inherit from the previous group. Per-group options:\n\
+        x-col, y-cols, y-names, header-row, data-start-row, delimiter,\n\
+        string-quote, merge-delimiter, fixed-width, x-time-scale, x-proportion,\n\
+        epochtime-col, epochtime-proportion. All other options are global and\n\
+        belong to the first group.\n\
+        X offset: every file shares the first file's X origin (unless\n\
+        --absolute-x). When both the first file and a later file define\n\
+        --epochtime-col, that file is instead shifted by the wall-clock\n\
+        difference of the epoch values, so different start times align.\n\n\
         Example:\n\
         {exe} data.csv --y-cols 2,3 --y-names \"Temp,Pressure\"\n\
-        {exe} data.tsv --delimiter tab --y-cols 2,3",
+        {exe} data.tsv --delimiter tab --y-cols 2,3\n\
+        {exe} a.csv --y-cols 2 -- b.csv -- c.csv --y-cols 4\n\
+        {exe} a.csv --y-cols 2 --epochtime-col 5 -- b.csv",
         ver = env!("FULL_VERSION"),
         exe = exe
     )
@@ -486,8 +512,13 @@ fn main() -> eframe::Result {
         SetProcessDpiAwarenessContext(-4isize as _);
     }
 
+    // Split argv on literal `--` tokens: the first segment is the normal CLI
+    // (globals + first file), each later segment describes one more file and
+    // inherits omitted options from the previous group.
+    let segments = groups::split_arg_groups(std::env::args().collect());
+
     // Parse CLI — all error/help paths show the same help_text()
-    let cli = match Cli::try_parse() {
+    let cli = match Cli::try_parse_from(&segments[0]) {
         Ok(cli) => {
             if cli.help || cli.csv_path.is_none() {
                 let help = help_text();
@@ -500,61 +531,61 @@ fn main() -> eframe::Result {
             }
             cli
         }
-        Err(e) => {
-            // --version: clap 기본 동작 유지
-            if e.kind() == clap::error::ErrorKind::DisplayVersion {
-                if !owns_console {
-                    println!("{}", e);
-                }
-                std::process::exit(0);
-            }
-            let help = help_text();
-            if owns_console {
-                show_help_window(help);
-            } else {
-                let msg = e.to_string();
-                let filtered: String = msg.lines()
-                    .filter(|l| !l.starts_with("Usage:"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                println!("EXCEPTION: {}\n\nRun `{} --help` for usage.", filtered.trim(), exe_name());
-            }
-            std::process::exit(1);
-        }
+        Err(e) => exit_with_parse_error(e, owns_console),
     };
 
+    let mut group_cfgs = vec![groups::GroupConfig::from_cli(&cli)];
+    for seg in &segments[1..] {
+        // A fully empty group would only duplicate the previous one — skip it
+        // (tolerates a trailing `--`).
+        if seg.is_empty() {
+            continue;
+        }
+        match groups::GroupCli::try_parse_from(seg) {
+            Ok(g) => {
+                let next = group_cfgs.last().unwrap().apply(&g);
+                group_cfgs.push(next);
+            }
+            Err(e) => exit_with_parse_error(e, owns_console),
+        }
+    }
+
     println!("PID: {}", std::process::id());
-    let csv_path = cli.csv_path.as_ref().unwrap();
-    if csv_path.exists() {
-        println!("WATCHING: {}", csv_path.display());
-    } else {
-        println!("WAITING: {}", csv_path.display());
+    for cfg in &group_cfgs {
+        if cfg.csv_path.exists() {
+            println!("WATCHING: {}", cfg.csv_path.display());
+        } else {
+            println!("WAITING: {}", cfg.csv_path.display());
+        }
     }
 
-    // Resolve x_time_scale → x_proportion
-    let mut cli = cli;
-    if let Some(ref scale) = cli.x_time_scale {
-        cli.x_proportion = match scale.as_str() {
-            "d" => 1.0 / 86400.0,
-            "h" => 1.0 / 3600.0,
-            "m" => 1.0 / 60.0,
-            "s" => 1.0,
-            _ => cli.x_proportion,
-        };
+    // Window title: unique file names (order kept) + explicit legend names
+    let mut file_names: Vec<String> = Vec::new();
+    for cfg in &group_cfgs {
+        let name = cfg
+            .csv_path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !file_names.contains(&name) {
+            file_names.push(name);
+        }
     }
+    let files_str = file_names.join(" + ");
 
-    let csv_filename = cli
-        .csv_path
-        .as_ref()
-        .and_then(|p| p.file_name())
-        .map(|f| f.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    let names_str = cli.y_names.join(",");
+    let mut names: Vec<String> = Vec::new();
+    for cfg in &group_cfgs {
+        for n in &cfg.y_names {
+            if !names.contains(n) {
+                names.push(n.clone());
+            }
+        }
+    }
+    let names_str = names.join(",");
     let title = if names_str.is_empty() {
-        format!("{} - HANA tail-f_plot - v{}", csv_filename, env!("FULL_VERSION"))
+        format!("{} - HANA tail-f_plot - v{}", files_str, env!("FULL_VERSION"))
     } else {
-        format!("{} - {} - HANA tail-f_plot - v{}", names_str, csv_filename, env!("FULL_VERSION"))
+        format!("{} - {} - HANA tail-f_plot - v{}", names_str, files_str, env!("FULL_VERSION"))
     };
 
     // Compute physical pixel placement when --bounds is specified (for SetWindowPos)
@@ -626,9 +657,35 @@ fn main() -> eframe::Result {
         &title,
         options,
         Box::new(move |cc| {
-            Ok(Box::new(app::PlotApp::new(cc, cli, title_for_app, physical_placement)))
+            Ok(Box::new(app::PlotApp::new(cc, cli, group_cfgs, title_for_app, physical_placement)))
         }),
     )
+}
+
+/// Shared clap-error exit path (used by the main CLI and each `--` group).
+fn exit_with_parse_error(e: clap::Error, owns_console: bool) -> ! {
+    // --version: clap 기본 동작 유지
+    if e.kind() == clap::error::ErrorKind::DisplayVersion {
+        if !owns_console {
+            println!("{}", e);
+        }
+        std::process::exit(0);
+    }
+    let help = help_text();
+    if owns_console {
+        show_help_window(help);
+    } else {
+        let msg = e.to_string();
+        let filtered: String = msg.lines()
+            .filter(|l| !l.starts_with("Usage:"))
+            // clap suggests `--` as a value escape, but tail-f_plot uses `--`
+            // as the file-group separator — hide the misleading tip.
+            .filter(|l| !l.trim_start().starts_with("tip: to pass"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("EXCEPTION: {}\n\nRun `{} --help` for usage.", filtered.trim(), exe_name());
+    }
+    std::process::exit(1);
 }
 
 /// Place window using FindWindowW + SetWindowPos. Uses physical pixel coordinates directly.

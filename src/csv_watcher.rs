@@ -174,6 +174,11 @@ impl CsvWatcher {
             None => x_str,
         };
         let x: f64 = x_str.parse().ok()?;
+        // "nan"/"inf" parse fine but cannot be plotted, and a non-finite x
+        // would poison the sorted-x tracking and every range scan built on it.
+        if !x.is_finite() {
+            return None;
+        }
         let x = x * self.x_proportion;
 
         // Epoch-time column: a row whose epoch cell is missing or invalid is

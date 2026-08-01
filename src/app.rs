@@ -1,6 +1,6 @@
 use eframe::egui;
 use egui::{PointerButton, Vec2b};
-use egui_plot::{Line, MarkerShape, Plot, PlotBounds, PlotPoint, PlotPoints, PlotResponse, Points};
+use egui_plot::{Line, MarkerShape, Plot, PlotPoint, PlotPoints, PlotResponse, Points};
 
 use crate::csv_watcher::CsvWatcher;
 use crate::custom_legend::LegendEntry;
@@ -28,8 +28,11 @@ const Y_AXIS_MIN_WIDTH: f32 = 52.0;
 const AUTO_MARGIN: f64 = 0.05;
 
 /// Expand a min/max extent by a margin fraction (fixed margin when degenerate).
+/// A reversed pair is normalized first — feeding `min > max` into
+/// `PlotBounds` collapses the axis to a sliver around the midpoint.
 fn with_margin((lo, hi): (f64, f64), frac: f64) -> (f64, f64) {
-    let m = (hi - lo).abs() * frac;
+    let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+    let m = (hi - lo) * frac;
     let m = if m > 0.0 { m } else { 1.0 };
     (lo - m, hi + m)
 }
@@ -41,14 +44,10 @@ fn global_x_extent(data: &PlotData, views: &[Option<GroupView>]) -> Option<(f64,
     let mut ext: Option<(f64, f64)> = None;
     for (group, view) in data.groups.iter().zip(views) {
         let Some(v) = view else { continue };
-        let Some(first) = group.series.first() else { continue };
-        let start = v.range.0.min(first.points.len());
-        let end = v.range.1.min(first.points.len());
-        if start >= end {
-            continue;
-        }
-        let lo = first.points[start].0 + v.offset;
-        let hi = first.points[end - 1].0 + v.offset;
+        // Real min/max, not first/last row: an X column that is not a
+        // timestamp (e.g. a temperature ramping up and down) is unsorted.
+        let Some((lo, hi)) = group.x_extent(v.range) else { continue };
+        let (lo, hi) = (lo + v.offset, hi + v.offset);
         ext = Some(match ext {
             None => (lo, hi),
             Some((a, b)) => (a.min(lo), b.max(hi)),
@@ -153,9 +152,12 @@ pub struct PlotApp {
     /// Shared y-axis width (min_width fed to every sub-plot). Ratchets up to
     /// the widest measured axis so all frames align pixel-exact; resets on Home.
     y_axis_width: f32,
-    /// Per stack row: pending bounds for zoom-out (x_min, x_max, y_min, y_max)
-    pending_bounds: Vec<Option<(f64, f64, f64, f64)>>,
-    /// Per stack row: currently displayed bounds (saved for drag restore)
+    /// Per stack row: bounds to force on the next frame, per axis. Kept split
+    /// because a gesture usually pins only one axis of one sub-plot — writing
+    /// X on the others would fight the linked x axis.
+    pending_x: Vec<Option<(f64, f64)>>,
+    pending_y: Vec<Option<(f64, f64)>>,
+    /// Per stack row: currently displayed bounds (x_min, x_max, y_min, y_max)
     current_bounds: Vec<Option<(f64, f64, f64, f64)>>,
     /// Physical pixel placement for SetWindowPos: [x, y, width, height]
     target_placement: Option<[i32; 4]>,
@@ -264,7 +266,8 @@ impl PlotApp {
             series_units,
             series_visible: vec![true; series_total],
             y_axis_width: Y_AXIS_MIN_WIDTH,
-            pending_bounds: vec![None; n_stacks],
+            pending_x: vec![None; n_stacks],
+            pending_y: vec![None; n_stacks],
             current_bounds: vec![None; n_stacks],
             target_placement,
             window_title,
@@ -318,7 +321,10 @@ impl eframe::App for PlotApp {
             if do_reset {
                 self.toolbar.auto_x = true;
                 self.toolbar.auto_y = true;
-                for p in self.pending_bounds.iter_mut() {
+                for p in self.pending_x.iter_mut() {
+                    *p = None;
+                }
+                for p in self.pending_y.iter_mut() {
                     *p = None;
                 }
                 // Re-fit the shared axis width from scratch (ranges change on Home)
@@ -429,41 +435,34 @@ impl eframe::App for PlotApp {
                     plot = plot.reset();
                 }
 
-                let pending = self.pending_bounds[r].take();
-                let current = self.current_bounds[r];
+                let pending_x = self.pending_x[r].take();
+                let pending_y = self.pending_y[r].take();
                 let y_fit = stack_y[r];
 
                 let response = plot.show(ui, |plot_ui| {
-                    if auto_x || auto_y {
-                        // Manual auto-fit: X spans the union of all stacks'
-                        // data (native per-plot auto would fit each sub-plot
-                        // to its own data and fight the linked x axis).
-                        let x_range = if auto_x {
-                            global_x.map(|e| with_margin(e, AUTO_MARGIN))
-                        } else {
-                            current.map(|c| (c.0, c.1))
-                        };
-                        let y_range = if auto_y {
-                            y_fit.map(|e| with_margin(e, AUTO_MARGIN))
-                        } else {
-                            current.map(|c| (c.2, c.3))
-                        };
-                        if let (Some((x0, x1)), Some((y0, y1))) = (x_range, y_range) {
-                            plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                                [x0, y0],
-                                [x1, y1],
-                            ));
-                        } else {
-                            // Nothing to fit yet (no data / first frame):
-                            // native per-axis auto as a harmless fallback.
-                            plot_ui.set_auto_bounds(Vec2b::new(auto_x, auto_y));
+                    // Each axis is driven independently: an axis that is
+                    // neither auto-fitted nor explicitly pinned this frame is
+                    // left to the plot's own memory, so a gesture applied to
+                    // it (zoom / pan / the linked x axis) survives.
+                    //
+                    // Manual auto-fit for X: it spans the union of all stacks'
+                    // data (native per-plot auto would fit each sub-plot to
+                    // its own data and fight the linked x axis).
+                    if auto_x {
+                        if let Some(e) = global_x {
+                            let (x0, x1) = with_margin(e, AUTO_MARGIN);
+                            plot_ui.set_plot_bounds_x(x0..=x1);
                         }
-                    } else if let Some((x_min, x_max, y_min, y_max)) = pending {
-                        // Apply programmatic bounds (zoom-out, partial auto restore)
-                        plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                            [x_min, y_min],
-                            [x_max, y_max],
-                        ));
+                    } else if let Some((x0, x1)) = pending_x {
+                        plot_ui.set_plot_bounds_x(x0..=x1);
+                    }
+                    if auto_y {
+                        if let Some(e) = y_fit {
+                            let (y0, y1) = with_margin(e, AUTO_MARGIN);
+                            plot_ui.set_plot_bounds_y(y0..=y1);
+                        }
+                    } else if let Some((y0, y1)) = pending_y {
+                        plot_ui.set_plot_bounds_y(y0..=y1);
                     }
 
                     let mut flat_idx = 0usize;
@@ -587,56 +586,32 @@ impl eframe::App for PlotApp {
                 .input(|i| i.events.iter().any(|e| matches!(e, egui::Event::MouseWheel { .. })));
 
             let mut any_hovered = false;
-            let mut user_interacted = false;
-            let mut zoom_in_box_completed = false;
+            // Sub-plot that received this frame's gesture (pan / wheel zoom /
+            // box zoom / zoom-out click). Only its Y is allowed to move.
+            let mut event_row: Option<usize> = None;
             let mut zoom_out_on: Option<usize> = None;
             for (r, show) in shows.iter().enumerate() {
                 let pr = &show.response;
-                let hovered = pr.hovered();
-                any_hovered |= hovered;
-                if pr.dragged() || pr.double_clicked() || (wheel_scrolled && hovered) {
-                    user_interacted = true;
-                }
-                if is_zoom_in && pr.drag_stopped() {
-                    zoom_in_box_completed = true;
+                any_hovered |= pr.hovered();
+                // Match egui_plot's own zoom test (`contains_pointer`, not
+                // `hovered`): over the legend overlay the plot still zooms but
+                // is not "hovered", and missing that would let the next frame's
+                // auto-fit undo the zoom.
+                let touched = pr.dragged()
+                    || pr.double_clicked()
+                    || (wheel_scrolled && pr.contains_pointer())
+                    || (is_zoom_in && pr.drag_stopped());
+                if touched {
+                    event_row.get_or_insert(r);
                 }
                 if mode == PlotMode::ZoomOut && pr.clicked() {
                     zoom_out_on = Some(r);
+                    event_row = Some(r);
                 }
             }
 
-            // ZoomOut: click to zoom out 1.5x centered on cursor (that sub-plot;
-            // the x part propagates to the others via the linked axis)
-            if let Some(r) = zoom_out_on {
-                if let Some(hover_pos) = shows[r].response.hover_pos() {
-                    let plot_pos = shows[r].transform.value_from_position(hover_pos);
-                    let bounds = shows[r].transform.bounds();
-                    let half_width = (bounds.max()[0] - bounds.min()[0]) / 2.0 * 1.5;
-                    let half_height = (bounds.max()[1] - bounds.min()[1]) / 2.0 * 1.5;
-                    self.pending_bounds[r] = Some((
-                        plot_pos.x - half_width,
-                        plot_pos.x + half_width,
-                        plot_pos.y - half_height,
-                        plot_pos.y + half_height,
-                    ));
-                }
-            }
-
-            // Disable auto on any user interaction (single place to avoid race conditions)
-            if user_interacted || zoom_in_box_completed || zoom_out_on.is_some() {
-                if self.toolbar.auto_x || self.toolbar.auto_y {
-                    self.toolbar.auto_x = false;
-                    self.toolbar.auto_y = false;
-                    // Save current bounds to prevent jump (unless ZoomOut already set pending)
-                    for r in 0..n {
-                        if self.pending_bounds[r].is_none() {
-                            self.pending_bounds[r] = self.current_bounds[r];
-                        }
-                    }
-                }
-            }
-
-            // Save current bounds each frame
+            // Save the bounds each sub-plot actually rendered with. This has to
+            // run before the Y pin below, which re-asserts exactly these.
             for (r, show) in shows.iter().enumerate() {
                 let bounds = show.transform.bounds();
                 self.current_bounds[r] = Some((
@@ -645,6 +620,53 @@ impl eframe::App for PlotApp {
                     bounds.min()[1],
                     bounds.max()[1],
                 ));
+            }
+
+            // ZoomOut: click to zoom out 1.5x centered on the cursor. Computed
+            // before the pin below so its X reaches every sub-plot too.
+            let zoom_out_target: Option<(f64, f64, f64, f64)> = zoom_out_on.and_then(|r| {
+                let hover_pos = shows[r].response.hover_pos()?;
+                let plot_pos = shows[r].transform.value_from_position(hover_pos);
+                let bounds = shows[r].transform.bounds();
+                let half_width = (bounds.max()[0] - bounds.min()[0]) / 2.0 * 1.5;
+                let half_height = (bounds.max()[1] - bounds.min()[1]) / 2.0 * 1.5;
+                Some((
+                    plot_pos.x - half_width,
+                    plot_pos.x + half_width,
+                    plot_pos.y - half_height,
+                    plot_pos.y + half_height,
+                ))
+            });
+
+            // A gesture takes the view off auto and is re-asserted on the next
+            // frame, because neither egui_plot's memory nor the link group can
+            // be trusted to carry it alone: the link group ends up holding the
+            // X of whichever sub-plot was drawn last, which would undo the
+            // gesture when the cursor sits on an earlier one.
+            //
+            // X: the gesture's X goes to every row (the axis is linked).
+            // Y: only the row under the cursor moves — every other row
+            //    re-asserts the Y it just rendered with.
+            if let Some(evt) = event_row {
+                self.toolbar.auto_x = false;
+                self.toolbar.auto_y = false;
+                let shared_x = zoom_out_target
+                    .map(|t| (t.0, t.1))
+                    .or_else(|| self.current_bounds[evt].map(|c| (c.0, c.1)));
+                for r in 0..n {
+                    if shared_x.is_some() {
+                        self.pending_x[r] = shared_x;
+                    }
+                    let y = if r == evt {
+                        zoom_out_target.map(|t| (t.2, t.3))
+                    } else {
+                        None
+                    }
+                    .or_else(|| self.current_bounds[r].map(|c| (c.2, c.3)));
+                    if y.is_some() {
+                        self.pending_y[r] = y;
+                    }
+                }
             }
 
             // Cursor icon per mode
@@ -703,9 +725,15 @@ impl eframe::App for PlotApp {
                     }
                 }
 
+                // The tooltip may overflow the hovered sub-plot into its
+                // neighbours — clip it to the whole stack, not to one frame.
+                let stack_rect = shows
+                    .iter()
+                    .fold(egui::Rect::NOTHING, |acc, s| acc.union(*s.transform.frame()));
                 crate::tooltip::render_tooltip(
                     ui,
                     *shows[r].transform.frame(),
+                    stack_rect,
                     &hover,
                     &self.x_unit,
                     self.x_proportion,

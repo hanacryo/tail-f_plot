@@ -44,11 +44,32 @@ pub struct HoverResult {
 
 /// Nearest row (by stored x) to `raw_target` within `range`, on a group's
 /// row-aligned point buffer. None when the range holds no rows.
-fn nearest_row(points: &[(f64, Option<f64>)], range: (usize, usize), raw_target: f64) -> Option<usize> {
+/// `sorted` mirrors `FileGroup::x_sorted`: false forces a linear scan, since
+/// binary search would land on an arbitrary row for an unsorted X column.
+fn nearest_row(
+    points: &[(f64, Option<f64>)],
+    range: (usize, usize),
+    raw_target: f64,
+    sorted: bool,
+) -> Option<usize> {
     let start = range.0.min(points.len());
     let end = range.1.min(points.len());
     if start >= end {
         return None;
+    }
+    if !sorted {
+        let mut best: Option<(usize, f64)> = None;
+        for i in start..end {
+            let d = (points[i].0 - raw_target).abs();
+            if d.is_nan() {
+                continue;
+            }
+            if best.map_or(true, |(_, bd)| d < bd) {
+                best = Some((i, d));
+            }
+        }
+        // All-NaN range: fall back to the first row rather than reporting none.
+        return Some(best.map_or(start, |(i, _)| i));
     }
     let idx = points[start..end].partition_point(|(x, _)| *x < raw_target) + start;
     Some(if idx >= end {
@@ -69,11 +90,29 @@ fn nearest_row(points: &[(f64, Option<f64>)], range: (usize, usize), raw_target:
 /// Whether `raw_target` lies within the plotted x extent of a group's visible
 /// range. Outside it no line exists (the file's recording ended earlier, or
 /// starts later), so no value should be reported there.
-fn extent_contains(points: &[(f64, Option<f64>)], range: (usize, usize), raw_target: f64) -> bool {
+fn extent_contains(
+    points: &[(f64, Option<f64>)],
+    range: (usize, usize),
+    raw_target: f64,
+    sorted: bool,
+) -> bool {
     let start = range.0.min(points.len());
     let end = range.1.min(points.len());
     if start >= end {
         return false;
+    }
+    if !sorted {
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for &(x, _) in &points[start..end] {
+            if x < lo {
+                lo = x;
+            }
+            if x > hi {
+                hi = x;
+            }
+        }
+        return lo <= hi && raw_target >= lo && raw_target <= hi;
     }
     raw_target >= points[start].0 && raw_target <= points[end - 1].0
 }
@@ -133,13 +172,21 @@ pub fn find_hover(
             continue;
         }
 
-        // Binary search for the cursor's X within the visible range.
-        let raw_cursor = hover_value.x - view.offset;
-        let hv_idx = first.points[start_idx..end_idx]
-            .partition_point(|(x, _)| *x < raw_cursor)
-            + start_idx;
-        let check_start = hv_idx.saturating_sub(5).max(start_idx);
-        let check_end = (hv_idx + 5).min(end_idx);
+        // Narrow the snap search to the cursor's neighbourhood by binary
+        // search. An unsorted X column has no such neighbourhood — any row
+        // may land near the cursor — so it scans the visible range instead.
+        let (check_start, check_end) = if group.x_sorted {
+            let raw_cursor = hover_value.x - view.offset;
+            let hv_idx = first.points[start_idx..end_idx]
+                .partition_point(|(x, _)| *x < raw_cursor)
+                + start_idx;
+            (
+                hv_idx.saturating_sub(5).max(start_idx),
+                (hv_idx + 5).min(end_idx),
+            )
+        } else {
+            (start_idx, end_idx)
+        };
 
         for (si, s) in group.series.iter().enumerate() {
             // Snap only to points drawn in the hovered sub-plot — other
@@ -187,8 +234,12 @@ pub fn find_hover(
         for (gi, group) in data.groups.iter().enumerate() {
             let Some(view) = views.get(gi).copied().flatten() else { continue };
             let Some(first) = group.series.first() else { continue };
-            let Some(row) = nearest_row(&first.points, view.range, hover_value.x - view.offset)
-            else {
+            let Some(row) = nearest_row(
+                &first.points,
+                view.range,
+                hover_value.x - view.offset,
+                group.x_sorted,
+            ) else {
                 continue;
             };
             let dx = first.points[row].0 + view.offset;
@@ -213,12 +264,12 @@ pub fn find_hover(
         let Some(view) = views.get(gi).copied().flatten() else { continue };
         let Some(first) = group.series.first() else { continue };
         let raw_target = target_x - view.offset;
-        let Some(row) = nearest_row(&first.points, view.range, raw_target) else {
+        let Some(row) = nearest_row(&first.points, view.range, raw_target, group.x_sorted) else {
             continue;
         };
         // Showing a nearest-row value where the group draws no line would be
         // misleading — skip the group entirely.
-        if !extent_contains(&first.points, view.range, raw_target) {
+        if !extent_contains(&first.points, view.range, raw_target, group.x_sorted) {
             continue;
         }
         for (si, s) in group.series.iter().enumerate() {
@@ -298,9 +349,15 @@ pub fn render_crosshair_h(ui: &Ui, frame_rect: Rect, y: f32) {
 /// Render the tooltip: row 1 is the X (`t =`/`x =`), row 2 is the free cursor
 /// `y =` (in the hovered stack's unit), and rows 3.. are each visible series
 /// (`swatch + name = value (unit)`) at the hovered row, grouped by stack.
+///
+/// `frame_rect` is the hovered sub-plot (it anchors the tooltip); `area_rect`
+/// is the region the box may occupy — the union of every sub-plot's frame, so
+/// a tooltip near a stack boundary spills over its neighbour instead of being
+/// clipped away.
 pub fn render_tooltip(
     ui: &Ui,
     frame_rect: Rect,
+    area_rect: Rect,
     hover: &HoverResult,
     x_unit: &str,
     x_proportion: f64,
@@ -376,17 +433,26 @@ pub fn render_tooltip(
             .fold(0.0_f32, f32::max);
     let content_h = row_h * rows.len() as f32;
 
-    // Position: upper-right of anchor, with edge avoidance.
+    // Position: upper-right of anchor, with edge avoidance against the whole
+    // stack area (flip first, then clamp so the box never leaves it).
     let mut pos = egui::pos2(hover.anchor.x + 8.0, hover.anchor.y - 8.0 - content_h);
-    if pos.x + content_w + 4.0 > frame_rect.right() {
+    if pos.x + content_w + 4.0 > area_rect.right() {
         pos.x = hover.anchor.x - 8.0 - content_w;
     }
-    if pos.y - 4.0 < frame_rect.top() {
+    if pos.y - 4.0 < area_rect.top() {
         pos.y = hover.anchor.y + 8.0;
     }
+    pos.x = pos.x.clamp(
+        area_rect.left() + 4.0,
+        (area_rect.right() - content_w - 4.0).max(area_rect.left() + 4.0),
+    );
+    pos.y = pos.y.clamp(
+        area_rect.top() + 4.0,
+        (area_rect.bottom() - content_h - 4.0).max(area_rect.top() + 4.0),
+    );
 
     let content_rect = Rect::from_min_size(pos, egui::vec2(content_w, content_h));
-    let painter = ui.painter().with_clip_rect(frame_rect);
+    let painter = ui.painter().with_clip_rect(area_rect);
     let bg_rect = content_rect.expand(4.0);
     painter.rect_filled(bg_rect, 2.0, bg_color);
     painter.rect_stroke(
@@ -500,11 +566,23 @@ mod tests {
     #[test]
     fn extent_excludes_before_start_and_after_end() {
         let p = pts(&[10.0, 20.0, 30.0]);
-        assert!(!extent_contains(&p, (0, 3), 9.9));   // before the first row
-        assert!(extent_contains(&p, (0, 3), 10.0));   // boundary inclusive
-        assert!(extent_contains(&p, (0, 3), 25.0));
-        assert!(extent_contains(&p, (0, 3), 30.0));   // boundary inclusive
-        assert!(!extent_contains(&p, (0, 3), 30.1));  // after the last row
+        assert!(!extent_contains(&p, (0, 3), 9.9, true));   // before the first row
+        assert!(extent_contains(&p, (0, 3), 10.0, true));   // boundary inclusive
+        assert!(extent_contains(&p, (0, 3), 25.0, true));
+        assert!(extent_contains(&p, (0, 3), 30.0, true));   // boundary inclusive
+        assert!(!extent_contains(&p, (0, 3), 30.1, true));  // after the last row
+    }
+
+    #[test]
+    fn extent_of_unsorted_x_uses_real_min_max() {
+        // Rises then falls: first/last row are neither the min nor the max.
+        let p = pts(&[30.0, 50.0, 20.0, 40.0]);
+        assert!(extent_contains(&p, (0, 4), 20.0, false));
+        assert!(extent_contains(&p, (0, 4), 50.0, false));
+        assert!(!extent_contains(&p, (0, 4), 19.9, false));
+        assert!(!extent_contains(&p, (0, 4), 50.1, false));
+        // The sorted shortcut would have reported the reversed [30, 40] window
+        assert!(!extent_contains(&p, (0, 4), 20.0, true));
     }
 
     #[test]
@@ -526,28 +604,42 @@ mod tests {
     fn extent_follows_visible_range_not_full_data() {
         let p = pts(&[0.0, 10.0, 20.0, 30.0]);
         // Only rows [1..3) visible: extent is [10, 20]
-        assert!(!extent_contains(&p, (1, 3), 5.0));
-        assert!(extent_contains(&p, (1, 3), 15.0));
-        assert!(!extent_contains(&p, (1, 3), 25.0));
+        assert!(!extent_contains(&p, (1, 3), 5.0, true));
+        assert!(extent_contains(&p, (1, 3), 15.0, true));
+        assert!(!extent_contains(&p, (1, 3), 25.0, true));
         // Empty range → nothing plotted
-        assert!(!extent_contains(&p, (2, 2), 20.0));
+        assert!(!extent_contains(&p, (2, 2), 20.0, true));
     }
 
     #[test]
     fn nearest_row_picks_closer_neighbor() {
         let p = pts(&[0.0, 10.0, 20.0]);
-        assert_eq!(nearest_row(&p, (0, 3), 4.0), Some(0));
-        assert_eq!(nearest_row(&p, (0, 3), 6.0), Some(1));
-        assert_eq!(nearest_row(&p, (0, 3), 100.0), Some(2));
-        assert_eq!(nearest_row(&p, (0, 3), -100.0), Some(0));
+        assert_eq!(nearest_row(&p, (0, 3), 4.0, true), Some(0));
+        assert_eq!(nearest_row(&p, (0, 3), 6.0, true), Some(1));
+        assert_eq!(nearest_row(&p, (0, 3), 100.0, true), Some(2));
+        assert_eq!(nearest_row(&p, (0, 3), -100.0, true), Some(0));
     }
 
     #[test]
     fn nearest_row_respects_range() {
         let p = pts(&[0.0, 10.0, 20.0, 30.0]);
-        assert_eq!(nearest_row(&p, (2, 4), 0.0), Some(2));
-        assert_eq!(nearest_row(&p, (2, 2), 0.0), None);
-        assert_eq!(nearest_row(&p, (5, 9), 0.0), None); // clamped past end
+        assert_eq!(nearest_row(&p, (2, 4), 0.0, true), Some(2));
+        assert_eq!(nearest_row(&p, (2, 2), 0.0, true), None);
+        assert_eq!(nearest_row(&p, (5, 9), 0.0, true), None); // clamped past end
+    }
+
+    #[test]
+    fn nearest_row_scans_when_x_is_unsorted() {
+        // Binary search would stop at the first ordering break; the scan finds
+        // the genuinely closest row wherever it sits.
+        let p = pts(&[30.0, 50.0, 20.0, 40.0]);
+        assert_eq!(nearest_row(&p, (0, 4), 21.0, false), Some(2));
+        assert_eq!(nearest_row(&p, (0, 4), 49.0, false), Some(1));
+        assert_eq!(nearest_row(&p, (0, 4), 1000.0, false), Some(1)); // max x
+        assert_eq!(nearest_row(&p, (0, 4), -1000.0, false), Some(2)); // min x
+        // Range still bounds the scan
+        assert_eq!(nearest_row(&p, (0, 2), 21.0, false), Some(0));
+        assert_eq!(nearest_row(&p, (2, 2), 0.0, false), None);
     }
 }
 

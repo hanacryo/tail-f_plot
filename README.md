@@ -167,7 +167,7 @@ On successful launch, two lines are printed to stdout and then **no further outp
 | `--max-x-range <F>` | `120.0` | Max visible X range after proportion (see note below) |
 | `--marker-radius <F>` | `4.0` | Data point marker radius |
 
-> **`--max-points` / `--max-x-range`:** Both limit the visible window. The stricter of the two applies (per file in multi-file mode).
+> **`--max-points` / `--max-x-range`:** Both limit the visible window. The stricter of the two applies (per file in multi-file mode). The X window is anchored at the newest row: `--max-x-range` keeps the rows back to the first one whose X leaves the window. This works for an X column that is not a timestamp too (e.g. `R` against a temperature that ramps up and down) — auto-fit then spans the column's true min/max, not the first and last row.
 
 ## Multiple Files
 
@@ -204,8 +204,8 @@ tail-f_plot.exe temp.csv --y-cols 5 --y-names Temp --y-stacks 1 --y-units K,A,V 
 ```
 
 - **Per-stack units**: `--y-units K,A,V` maps units positionally by stack *index* (stack 3 always takes the third entry). Missing entries fall back to `--y-unit`.
-- **Linked X axis**: dragging or zooming the X range in any sub-plot moves all of them together; Y stays independent per sub-plot. Auto-X fits the union of every stack's data.
-- **One hover, every sub-plot**: the vertical crosshair tracks the cursor's time position across all sub-plots, and the tooltip lists every visible series (all stacks) at that time, each with its stack's unit.
+- **Linked X axis**: dragging or zooming the X range in any sub-plot moves all of them together. Y stays independent: a wheel zoom, box zoom, click zoom-out or pan only rescales the Y of the sub-plot under the cursor — every other one keeps the Y range it had. Auto-X fits the union of every stack's data.
+- **One hover, every sub-plot**: the vertical crosshair tracks the cursor's time position across all sub-plots, and the tooltip lists every visible series (all stacks) at that time, each with its stack's unit. The tooltip box may overflow into the neighbouring sub-plots rather than being clipped at the stack boundary.
 - **Layout**: sub-plots split the window height equally; the X axis (ticks + label) is drawn on the bottom sub-plot only. Each sub-plot has its own legend.
 
 > **Notes**

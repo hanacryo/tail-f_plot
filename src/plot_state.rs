@@ -34,6 +34,40 @@ pub struct FileGroup {
     pub epoch_anchor: Option<(f64, f64)>,
     /// Whether this group has an epoch-time column configured.
     epoch_expected: bool,
+    /// True while every row's x is >= the previous row's. A time column stays
+    /// sorted; an arbitrary X column (e.g. R plotted against a temperature
+    /// that ramps up and down) does not. Binary search and the
+    /// "first/last row = min/max x" shortcut are only valid while this holds.
+    pub x_sorted: bool,
+}
+
+impl FileGroup {
+    /// Min/max stored x (offset not applied) over the row range `range`.
+    /// O(1) while `x_sorted`, a scan otherwise. None when the range is empty
+    /// or holds no finite x.
+    pub fn x_extent(&self, range: (usize, usize)) -> Option<(f64, f64)> {
+        let first = self.series.first()?;
+        let start = range.0.min(first.points.len());
+        let end = range.1.min(first.points.len());
+        if start >= end {
+            return None;
+        }
+        if self.x_sorted {
+            return Some((first.points[start].0, first.points[end - 1].0));
+        }
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for &(x, _) in &first.points[start..end] {
+            if x < lo {
+                lo = x;
+            }
+            if x > hi {
+                hi = x;
+            }
+        }
+        // NaN-only ranges leave the sentinels untouched.
+        (lo <= hi).then_some((lo, hi))
+    }
 }
 
 /// Per-group render info: the visible index range on the group's row-aligned
@@ -64,6 +98,7 @@ impl PlotData {
             origin_x: None,
             epoch_anchor: None,
             epoch_expected,
+            x_sorted: true,
         });
     }
 
@@ -77,6 +112,13 @@ impl PlotData {
         let g = &mut self.groups[group];
         if g.origin_x.is_none() {
             g.origin_x = Some(x);
+        }
+        // One out-of-order row is enough to disable the sorted-x shortcuts for
+        // this group; the flag never goes back to true.
+        if let Some(&(prev_x, _)) = g.series.first().and_then(|s| s.points.last()) {
+            if x < prev_x {
+                g.x_sorted = false;
+            }
         }
         if g.epoch_expected && g.epoch_anchor.is_none() {
             if let Some(e) = epoch {
@@ -152,9 +194,20 @@ impl PlotData {
 
                 // Time-based start index (threshold converted to stored x)
                 let raw_threshold = (last - max_x_range) - off;
-                let time_start = g.series[0]
-                    .points
-                    .partition_point(|(x, _)| *x < raw_threshold);
+                let points = &g.series[0].points;
+                let time_start = if g.x_sorted {
+                    points.partition_point(|(x, _)| *x < raw_threshold)
+                } else {
+                    // Unsorted x: walk back from the newest row and stop at the
+                    // first one outside the window. Keeps the rendered slice
+                    // contiguous (no holes in the line) and reduces to the
+                    // binary search above whenever x happens to be sorted.
+                    let mut i = points.len();
+                    while i > 0 && points[i - 1].0 >= raw_threshold {
+                        i -= 1;
+                    }
+                    i
+                };
 
                 // Point-count-based start index
                 let count_start = total.saturating_sub(max_points);
@@ -273,6 +326,61 @@ mod tests {
         }
         let views = d.views(3, 1e9);
         assert_eq!(views[0].unwrap().range, (7, 10));
+    }
+
+    #[test]
+    fn x_sorted_flag_tracks_out_of_order_rows() {
+        let mut d = PlotData::new(true);
+        d.add_group(&names(1), false);
+        for x in [10.0, 20.0, 20.0, 30.0] {
+            d.push_row(0, x, None, &[Some(1.0)]);
+        }
+        assert!(d.groups[0].x_sorted); // ties stay sorted
+        d.push_row(0, 25.0, None, &[Some(1.0)]);
+        assert!(!d.groups[0].x_sorted);
+        d.push_row(0, 99.0, None, &[Some(1.0)]);
+        assert!(!d.groups[0].x_sorted); // never goes back
+    }
+
+    #[test]
+    fn x_extent_is_real_min_max_when_unsorted() {
+        let mut d = PlotData::new(true);
+        d.add_group(&names(1), false);
+        // Ramps up then down: first/last row are neither min nor max.
+        for x in [30.0, 50.0, 20.0, 40.0] {
+            d.push_row(0, x, None, &[Some(1.0)]);
+        }
+        let g = &d.groups[0];
+        assert!(!g.x_sorted);
+        assert_eq!(g.x_extent((0, 4)), Some((20.0, 50.0)));
+        // Sub-range only
+        assert_eq!(g.x_extent((0, 2)), Some((30.0, 50.0)));
+        assert_eq!(g.x_extent((2, 2)), None);
+    }
+
+    #[test]
+    fn x_extent_uses_endpoints_while_sorted() {
+        let mut d = PlotData::new(true);
+        d.add_group(&names(1), false);
+        for x in [10.0, 20.0, 30.0] {
+            d.push_row(0, x, None, &[Some(1.0)]);
+        }
+        assert_eq!(d.groups[0].x_extent((0, 3)), Some((10.0, 30.0)));
+        assert_eq!(d.groups[0].x_extent((1, 3)), Some((20.0, 30.0)));
+    }
+
+    #[test]
+    fn views_window_on_unsorted_x_keeps_a_contiguous_tail() {
+        let mut d = PlotData::new(true);
+        d.add_group(&names(1), false);
+        // Newest row is x = 40; rows 0..2 fall outside a window of 15.
+        for x in [30.0, 50.0, 20.0, 40.0] {
+            d.push_row(0, x, None, &[Some(1.0)]);
+        }
+        // Window = [40 - 15, ..] → walking back stops at x = 20 (row 2).
+        assert_eq!(d.views(1000, 15.0)[0].unwrap().range, (3, 4));
+        // A window wide enough to cover every row keeps them all.
+        assert_eq!(d.views(1000, 1e9)[0].unwrap().range, (0, 4));
     }
 
     #[test]

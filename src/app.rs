@@ -161,7 +161,8 @@ pub struct PlotApp {
     current_bounds: Vec<Option<(f64, f64, f64, f64)>>,
     /// Physical pixel placement for SetWindowPos: [x, y, width, height]
     target_placement: Option<[i32; 4]>,
-    window_title: String,
+    /// This instance's own root window (HWND as isize)
+    root_hwnd: Option<isize>,
     placement_applied: bool,
 }
 
@@ -170,7 +171,6 @@ impl PlotApp {
         cc: &eframe::CreationContext<'_>,
         cli: Cli,
         groups: Vec<GroupConfig>,
-        window_title: String,
         target_placement: Option<[i32; 4]>,
     ) -> Self {
         crate::register_fonts(&cc.egui_ctx);
@@ -270,7 +270,7 @@ impl PlotApp {
             pending_y: vec![None; n_stacks],
             current_bounds: vec![None; n_stacks],
             target_placement,
-            window_title,
+            root_hwnd: crate::native_hwnd(cc),
             placement_applied: false,
         }
     }
@@ -291,8 +291,8 @@ impl eframe::App for PlotApp {
         // First frame: Win32 SetWindowPos for precise physical coordinate placement
         if !self.placement_applied {
             self.placement_applied = true;
-            if let Some([x, y, w, h]) = self.target_placement {
-                crate::apply_window_placement(&self.window_title, x, y, w, h);
+            if let (Some(hwnd), Some([x, y, w, h])) = (self.root_hwnd, self.target_placement) {
+                crate::apply_window_placement(hwnd, x, y, w, h);
             }
         }
 
@@ -330,11 +330,6 @@ impl eframe::App for PlotApp {
                 // Re-fit the shared axis width from scratch (ranges change on Home)
                 self.y_axis_width = Y_AXIS_MIN_WIDTH;
                 self.toolbar.need_home = false;
-            }
-            // Auto toggle: just clear the flag (set_auto_bounds handles per-axis
-            // auto natively in 0.34; a reset here would cause a view jump).
-            if self.toolbar.need_reset {
-                self.toolbar.need_reset = false;
             }
 
             let views = self.data.views(self.max_points, self.max_x_range);
@@ -440,6 +435,15 @@ impl eframe::App for PlotApp {
                 let y_fit = stack_y[r];
 
                 let response = plot.show(ui, |plot_ui| {
+                    // egui_plot's own auto-bounds are never used: auto-fit is
+                    // done manually below. Its memory starts out (and returns
+                    // after Home's reset) with native auto on, which would
+                    // otherwise keep fitting per sub-plot whenever no bound
+                    // is set below — e.g. Auto turned off before any data.
+                    // With it off, an axis with nothing to fit keeps its last
+                    // range.
+                    plot_ui.set_auto_bounds(Vec2b::FALSE);
+
                     // Each axis is driven independently: an axis that is
                     // neither auto-fitted nor explicitly pinned this frame is
                     // left to the plot's own memory, so a gesture applied to

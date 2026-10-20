@@ -8,13 +8,10 @@ pub struct ToolbarState {
     pub auto_x: bool,           // auto bounds for X axis only
     pub auto_y: bool,           // auto bounds for Y axis only
     pub need_home: bool,
-    pub need_reset: bool,       // plot internal memory reset needed (on auto toggle)
     pub log_scale: bool,        // manual log scale toggle
     pub legend_pos: Corner,     // legend position (4 corners)
     pub show_about: bool,       // About modal display flag
     prev_log_scale: bool,       // previous frame log scale state (for change detection)
-    prev_auto_x: bool,          // previous frame auto_x state (for toggle detection)
-    prev_auto_y: bool,          // previous frame auto_y state (for toggle detection)
 }
 
 impl Default for ToolbarState {
@@ -24,13 +21,10 @@ impl Default for ToolbarState {
             auto_x: true,
             auto_y: true,
             need_home: false,
-            need_reset: false,
             log_scale: false,
             legend_pos: Corner::LeftBottom, // default: bottom-left
             show_about: false,
             prev_log_scale: false,
-            prev_auto_x: true,
-            prev_auto_y: true,
         }
     }
 }
@@ -110,15 +104,5 @@ impl ToolbarState {
             self.need_home = true;
             self.prev_log_scale = self.log_scale;
         }
-
-        // Auto-X/Auto-Y turned on -> trigger reset (turning off keeps current bounds)
-        // Partial auto (single axis) is fully supported
-        let auto_x_turned_on = self.auto_x && !self.prev_auto_x;
-        let auto_y_turned_on = self.auto_y && !self.prev_auto_y;
-        if auto_x_turned_on || auto_y_turned_on {
-            self.need_reset = true;
-        }
-        self.prev_auto_x = self.auto_x;
-        self.prev_auto_y = self.auto_y;
     }
 }

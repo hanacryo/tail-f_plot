@@ -50,14 +50,26 @@ fn hide_own_console() -> bool {
 #[cfg(not(windows))]
 fn hide_own_console() -> bool { false }
 
+/// Memory-map a font file for the rest of the process. Many instances run at
+/// once and Malgun Gothic alone is ~13 MB: a mapping is backed by the shared
+/// OS page cache, and egui borrows `from_static` bytes without copying them
+/// (`from_owned` data is cloned again when the font is built).
+fn map_font(path: &str) -> Option<&'static [u8]> {
+    let file = std::fs::File::open(path).ok()?;
+    // SAFETY: system font files are not modified while the process runs;
+    // the mapping is leaked so the slice stays valid for 'static.
+    let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+    Some(&Box::leak(Box::new(map))[..])
+}
+
 /// Register OS fonts as primary, with egui defaults as fallback.
 pub fn register_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
     // Load OS fonts
     let mut load = |key: &str, path: &str| -> bool {
-        if let Ok(data) = std::fs::read(path) {
-            fonts.font_data.insert(key.into(), egui::FontData::from_owned(data).into());
+        if let Some(data) = map_font(path) {
+            fonts.font_data.insert(key.into(), egui::FontData::from_static(data).into());
             true
         } else {
             false
@@ -67,18 +79,22 @@ pub fn register_fonts(ctx: &egui::Context) {
     let has_bold   = load("segoe_bold", "C:\\Windows\\Fonts\\segoeuib.ttf");
     let has_mono   = load("consolas", "C:\\Windows\\Fonts\\consola.ttf");
     let has_symbol = load("segoe_symbol", "C:\\Windows\\Fonts\\seguisym.ttf");
+    // Hangul fallback (legend names, file paths); Segoe UI has no Hangul
+    let has_malgun = load("malgun", "C:\\Windows\\Fonts\\malgun.ttf");
+    let has_malgun_bold = load("malgun_bold", "C:\\Windows\\Fonts\\malgunbd.ttf");
 
-    // Prepend OS font to Proportional (Segoe UI → Segoe UI Symbol → egui defaults)
+    // Prepend OS font to Proportional
+    // (Segoe UI → Segoe UI Symbol → Malgun Gothic → egui defaults)
     if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        if has_malgun { family.insert(0, "malgun".into()); }
         if has_symbol { family.insert(0, "segoe_symbol".into()); }
         if has_segoe  { family.insert(0, "segoe_ui".into()); }
     }
 
-    // Prepend OS font to Monospace (Consolas → egui defaults as fallback)
-    if has_mono {
-        if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-            family.insert(0, "consolas".into());
-        }
+    // Prepend OS font to Monospace (Consolas → Malgun Gothic → egui defaults)
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+        if has_malgun { family.insert(0, "malgun".into()); }
+        if has_mono   { family.insert(0, "consolas".into()); }
     }
 
     // Bold family: Segoe UI Bold + Proportional fallback
@@ -93,6 +109,9 @@ pub fn register_fonts(ctx: &egui::Context) {
         .or_default();
     if has_bold {
         bold_family.push("segoe_bold".into());
+    }
+    if has_malgun_bold {
+        bold_family.push("malgun_bold".into());
     }
     for name in proportional_names {
         bold_family.push(name);
@@ -664,12 +683,11 @@ fn main() -> eframe::Result {
         unsafe { windows_sys::Win32::System::Console::FreeConsole(); }
     }
 
-    let title_for_app = title.clone();
     eframe::run_native(
         &title,
         options,
         Box::new(move |cc| {
-            Ok(Box::new(app::PlotApp::new(cc, cli, group_cfgs, title_for_app, physical_placement)))
+            Ok(Box::new(app::PlotApp::new(cc, cli, group_cfgs, physical_placement)))
         }),
     )
 }
@@ -700,22 +718,24 @@ fn exit_with_parse_error(e: clap::Error, owns_console: bool) -> ! {
     std::process::exit(1);
 }
 
-/// Place window using FindWindowW + SetWindowPos. Uses physical pixel coordinates directly.
-#[cfg(windows)]
-pub fn apply_window_placement(title: &str, x: i32, y: i32, w: i32, h: i32) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::*;
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
+/// Native window handle (HWND as isize) of an eframe window, taken straight
+/// from the window itself. Never search windows by title: many instances with
+/// identical titles run at once, and a title lookup can hit another process.
+pub fn native_hwnd(handle: &impl raw_window_handle::HasWindowHandle) -> Option<isize> {
+    match handle.window_handle().ok()?.as_raw() {
+        raw_window_handle::RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+        _ => None,
+    }
+}
 
-    let title_wide: Vec<u16> = OsStr::new(title).encode_wide().chain(std::iter::once(0)).collect();
+/// Place a window by its exact HWND (physical pixel coordinates).
+#[cfg(windows)]
+pub fn apply_window_placement(hwnd: isize, x: i32, y: i32, w: i32, h: i32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
     unsafe {
-        let hwnd = FindWindowW(std::ptr::null(), title_wide.as_ptr());
-        if !hwnd.is_null() {
-            // SWP_NOZORDER(0x0004): don't change z-order
-            SetWindowPos(hwnd, std::ptr::null_mut(), x, y, w, h, 0x0004);
-        }
+        SetWindowPos(hwnd as _, std::ptr::null_mut(), x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
     }
 }
 
 #[cfg(not(windows))]
-pub fn apply_window_placement(_title: &str, _x: i32, _y: i32, _w: i32, _h: i32) {}
+pub fn apply_window_placement(_hwnd: isize, _x: i32, _y: i32, _w: i32, _h: i32) {}

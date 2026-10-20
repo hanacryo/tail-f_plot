@@ -11,6 +11,8 @@ eframe = "0.34"
 egui_plot = "0.35"
 clap = { version = "4", features = ["derive"] }
 notify = "7"
+memmap2 = "0.9"
+raw-window-handle = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

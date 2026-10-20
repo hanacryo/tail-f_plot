@@ -353,6 +353,10 @@ pub struct Cli {
     /// Marker radius
     #[arg(long, default_value_t = 4.0)]
     marker_radius: f32,
+
+    /// Render once, save a PNG screenshot of the window to this path, exit
+    #[arg(long)]
+    oneshot: Option<PathBuf>,
 }
 
 /// Resolve delimiter name to actual string
@@ -423,7 +427,8 @@ fn help_text() -> String {
         --max-points <N>           Max points per series [default: 5000]\n\
         --max-x-range <F>          Max X range [default: 120.0]\n\
           (max-points / max-x-range: stricter of the two applies)\n\
-        --marker-radius <F>        Marker radius [default: 4.0]\n\n\
+        --marker-radius <F>        Marker radius [default: 4.0]\n\
+        --oneshot <PNG_PATH>       Render once, save a screenshot, exit\n\n\
         Multi-file:\n\
         `--` starts a new file group plotted on the same axes. Omitted options\n\
         (even the file path) inherit from the previous group. Per-group options:\n\
@@ -671,10 +676,27 @@ fn main() -> eframe::Result {
         viewport.with_inner_size([WIN_W, WIN_H])
     };
 
+    // One-shot capture: don't steal focus from whatever the user is doing.
+    let viewport = if cli.oneshot.is_some() {
+        viewport.with_active(false)
+    } else {
+        viewport
+    };
+
     let options = eframe::NativeOptions {
         viewport,
         ..Default::default()
     };
+
+    // One-shot watchdog: if the capture never completes (window minimized,
+    // unsupported surface format, stalled event loop), exit anyway.
+    if cli.oneshot.is_some() {
+        std::thread::spawn(|| {
+            std::thread::sleep(app::ONESHOT_TIMEOUT + ONESHOT_WATCHDOG_GRACE);
+            println!("EXCEPTION: oneshot: no screenshot was captured");
+            std::process::exit(ONESHOT_EXIT_STALLED);
+        });
+    }
 
     // Free the hidden console before launching the GUI (double-click case).
     // For CLI launches this is a no-op since we don't own the console.
@@ -683,14 +705,30 @@ fn main() -> eframe::Result {
         unsafe { windows_sys::Win32::System::Console::FreeConsole(); }
     }
 
-    eframe::run_native(
+    let oneshot = cli.oneshot.is_some();
+    let result = eframe::run_native(
         &title,
         options,
         Box::new(move |cc| {
             Ok(Box::new(app::PlotApp::new(cc, cli, group_cfgs, physical_placement)))
         }),
-    )
+    );
+    if oneshot {
+        std::process::exit(ONESHOT_EXIT.load(std::sync::atomic::Ordering::SeqCst));
+    }
+    result
 }
+
+/// Exit code of a `--oneshot` run, set by the app before it closes:
+/// 0 = captured after the view settled, `ONESHOT_EXIT_TIMEOUT` = captured
+/// after the settle timeout (e.g. a file never appeared), 1 = PNG write
+/// failed. Stays at `ONESHOT_EXIT_STALLED` until a capture is handled.
+pub static ONESHOT_EXIT: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(ONESHOT_EXIT_STALLED);
+pub const ONESHOT_EXIT_TIMEOUT: i32 = 3;
+const ONESHOT_EXIT_STALLED: i32 = 4;
+/// Extra time the watchdog grants a requested screenshot to arrive.
+const ONESHOT_WATCHDOG_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Shared clap-error exit path (used by the main CLI and each `--` group).
 fn exit_with_parse_error(e: clap::Error, owns_console: bool) -> ! {

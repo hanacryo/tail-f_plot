@@ -116,6 +116,8 @@ On successful launch, two lines are printed to stdout and then **no further outp
 | `HANA ` | Help text displayed (no args, or `--help`). | 0 or 1 |
 | `EXCEPTION: ` | Invalid arguments. Error detail follows. | 1 |
 
+With `--oneshot <PNG_PATH>` the window renders once, saves a screenshot and exits. After the usual lines it prints `SCREENSHOT: <absolute path>` (or `EXCEPTION: oneshot: ...`). Exit codes: `0` = captured once the view settled (every file read, layout stable); `3` = captured after a 15 s settle timeout (e.g. a file that never appeared); `1` = the PNG could not be written; `4` = no screenshot could be captured at all. The window opens without taking focus, ignores the mouse, and stops reading new rows once the capture is requested.
+
 > `cmd start` and PowerShell `Start-Process` cannot capture stdout. Git Bash `&` is the only shell method that shows stdout while returning the prompt. To capture stdout programmatically, spawn the process directly with a pipe.
 
 ### Arguments
@@ -166,6 +168,7 @@ On successful launch, two lines are printed to stdout and then **no further outp
 | `--max-points <N>` | `5000` | Max rendered points per series (see note below) |
 | `--max-x-range <F>` | `120.0` | Max visible X range after proportion (see note below) |
 | `--marker-radius <F>` | `4.0` | Data point marker radius |
+| `--oneshot <PNG_PATH>` | | Render once, save a PNG screenshot, exit (see stdout status) |
 
 > **`--max-points` / `--max-x-range`:** Both limit the visible window. The stricter of the two applies (per file in multi-file mode). The X window is anchored at the newest row: `--max-x-range` keeps the rows back to the first one whose X leaves the window. This works for an X column that is not a timestamp too (e.g. `R` against a temperature that ramps up and down) — auto-fit then spans the column's true min/max, not the first and last row.
 

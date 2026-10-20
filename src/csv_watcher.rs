@@ -25,6 +25,8 @@ pub struct CsvWatcher {
     x_proportion: f64,
     epoch_col: Option<usize>, // 0-based
     epoch_proportion: f64,
+    /// The file has been opened and read through to its end at least once.
+    loaded: bool,
 }
 
 impl CsvWatcher {
@@ -46,7 +48,14 @@ impl CsvWatcher {
             x_proportion: cfg.x_proportion,
             epoch_col: cfg.epochtime_col.checked_sub(1),
             epoch_proportion: cfg.epoch_proportion(),
+            loaded: false,
         }
+    }
+
+    /// True once every complete line present at the first successful open
+    /// has been read (a trailing line without its newline is still pending).
+    pub fn initial_load_done(&self) -> bool {
+        self.loaded
     }
 
     pub fn start(&mut self) {
@@ -124,6 +133,7 @@ impl CsvWatcher {
                 }
             }
         }
+        self.loaded = true;
 
         #[cfg(debug_assertions)]
         if !rows_to_parse.is_empty() {

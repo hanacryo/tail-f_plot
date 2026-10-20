@@ -1,3 +1,6 @@
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
 use eframe::egui;
 use egui::{PointerButton, Vec2b};
 use egui_plot::{Line, MarkerShape, Plot, PlotPoint, PlotPoints, PlotResponse, Points};
@@ -26,6 +29,44 @@ const Y_AXIS_MIN_WIDTH: f32 = 52.0;
 
 /// Auto-fit margin fraction (mimics egui_plot's native auto bounds feel)
 const AUTO_MARGIN: f64 = 0.05;
+
+/// `--oneshot`: capture anyway once this long has passed without the view
+/// settling (e.g. a file that never appears, an offset that never resolves).
+pub const ONESHOT_TIMEOUT: Duration = Duration::from_secs(15);
+/// `--oneshot` frame pacing while waiting to settle. Must exceed egui's
+/// predicted frame time (1/60 s): shorter delays are rounded down to an
+/// immediate repaint, which the settle check reads as "still changing".
+const ONESHOT_FRAME_DELAY: Duration = Duration::from_millis(50);
+/// `--oneshot`: consecutive settled frames required before capturing.
+const ONESHOT_STABLE_FRAMES: u32 = 2;
+/// `--oneshot`: minimum frames before a capture (fonts, legend sizing pass).
+const ONESHOT_MIN_FRAMES: u32 = 3;
+
+/// State of a `--oneshot` run: wait for the view to settle, capture one
+/// screenshot, write it as PNG, close.
+struct OneShot {
+    path: PathBuf,
+    started: Instant,
+    frames: u32,
+    /// Consecutive frames that met every settle condition.
+    stable: u32,
+    /// Screenshot requested; data polling is frozen from here on so the
+    /// captured frame shows the state that was judged settled.
+    requested: bool,
+    timed_out: bool,
+    done: bool,
+}
+
+/// Write a screenshot as an opaque RGBA PNG.
+fn save_png(path: &Path, image: &egui::ColorImage) -> Result<(), String> {
+    let [w, h] = image.size;
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for c in &image.pixels {
+        rgba.extend_from_slice(&[c.r(), c.g(), c.b(), 255]);
+    }
+    image::save_buffer(path, &rgba, w as u32, h as u32, image::ColorType::Rgba8)
+        .map_err(|e| e.to_string())
+}
 
 /// Expand a min/max extent by a margin fraction (fixed margin when degenerate).
 /// A reversed pair is normalized first — feeding `min > max` into
@@ -164,6 +205,7 @@ pub struct PlotApp {
     /// This instance's own root window (HWND as isize)
     root_hwnd: Option<isize>,
     placement_applied: bool,
+    oneshot: Option<OneShot>,
 }
 
 impl PlotApp {
@@ -272,6 +314,15 @@ impl PlotApp {
             target_placement,
             root_hwnd: crate::native_hwnd(cc),
             placement_applied: false,
+            oneshot: cli.oneshot.map(|path| OneShot {
+                path,
+                started: Instant::now(),
+                frames: 0,
+                stable: 0,
+                requested: false,
+                timed_out: false,
+                done: false,
+            }),
         }
     }
 }
@@ -280,6 +331,23 @@ impl eframe::App for PlotApp {
     /// Convert scroll-wheel to zoom (inject Ctrl so egui treats scroll as zoom_delta)
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         use egui::Event;
+        // One-shot: a window that opens under the cursor would otherwise
+        // capture a hover crosshair/tooltip, making the result arbitrary.
+        if self.oneshot.is_some() {
+            raw_input.events.retain(|e| {
+                !matches!(
+                    e,
+                    Event::PointerMoved(_)
+                        | Event::MouseMoved(_)
+                        | Event::PointerButton { .. }
+                        | Event::PointerGone
+                        | Event::MouseWheel { .. }
+                        | Event::Touch { .. }
+                        | Event::Zoom(_)
+                        | Event::Rotate(_)
+                )
+            });
+        }
         for event in &mut raw_input.events {
             if let Event::MouseWheel { modifiers, .. } = event {
                 modifiers.ctrl = true;
@@ -296,11 +364,20 @@ impl eframe::App for PlotApp {
             }
         }
 
-        for (i, watcher) in self.watchers.iter_mut().enumerate() {
-            watcher.poll(&mut self.data, i);
+        self.oneshot_receive(ui.ctx());
+
+        // A requested one-shot capture freezes the data it was judged on.
+        let frozen = self.oneshot.as_ref().is_some_and(|o| o.requested);
+        if !frozen {
+            for (i, watcher) in self.watchers.iter_mut().enumerate() {
+                watcher.poll(&mut self.data, i);
+            }
         }
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(self.repaint_interval_ms));
+        // One-shot paces its own frames (see oneshot_tick)
+        if self.oneshot.is_none() {
+            ui.ctx()
+                .request_repaint_after(Duration::from_millis(self.repaint_interval_ms));
+        }
 
         egui::Panel::top("toolbar").show_inside(ui, |ui| {
             self.toolbar.ui(ui);
@@ -310,6 +387,7 @@ impl eframe::App for PlotApp {
             crate::render_about_modal(ui.ctx(), &mut self.toolbar.show_about);
         }
 
+        let mut all_resolved = false;
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let mode = self.toolbar.mode;
             let is_log_scale = self.toolbar.log_scale;
@@ -333,6 +411,7 @@ impl eframe::App for PlotApp {
             }
 
             let views = self.data.views(self.max_points, self.max_x_range);
+            all_resolved = views.iter().all(Option::is_some);
             let auto_x = self.toolbar.auto_x;
             let auto_y = self.toolbar.auto_y;
 
@@ -783,6 +862,77 @@ impl eframe::App for PlotApp {
                 );
             }
         });
+
+        self.oneshot_tick(ui.ctx(), all_resolved);
+    }
+}
+
+impl PlotApp {
+    /// One-shot: decide whether the view has settled and request the capture.
+    /// Settled = every file read through once, every group renderable, no
+    /// image still loading, and no immediate repaint requested last pass
+    /// (layout convergence: shared y-axis width, legend sizing pass) — held
+    /// for `ONESHOT_STABLE_FRAMES` consecutive frames.
+    fn oneshot_tick(&mut self, ctx: &egui::Context, all_resolved: bool) {
+        let loaded = self.watchers.iter().all(CsvWatcher::initial_load_done);
+        let Some(os) = self.oneshot.as_mut() else { return };
+        if os.done {
+            return;
+        }
+        if os.requested {
+            // The capture arrives a few frames later; keep frames coming.
+            ctx.request_repaint();
+            return;
+        }
+        os.frames += 1;
+        let settled = loaded
+            && all_resolved
+            && os.frames >= ONESHOT_MIN_FRAMES
+            && !ctx.has_pending_images()
+            && !ctx.requested_repaint_last_pass();
+        os.stable = if settled { os.stable + 1 } else { 0 };
+        let ready = os.stable >= ONESHOT_STABLE_FRAMES;
+        if ready || os.started.elapsed() >= ONESHOT_TIMEOUT {
+            os.timed_out = !ready;
+            os.requested = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(ONESHOT_FRAME_DELAY);
+        }
+    }
+
+    /// One-shot: write a delivered screenshot, report it, close the app.
+    fn oneshot_receive(&mut self, ctx: &egui::Context) {
+        let Some(os) = self.oneshot.as_mut() else { return };
+        if os.done || !os.requested {
+            return;
+        }
+        let image = ctx.input(|i| {
+            i.raw.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        let Some(image) = image else { return };
+        os.done = true;
+        let code = match save_png(&os.path, &image) {
+            Ok(()) => {
+                let shown = std::path::absolute(&os.path).unwrap_or_else(|_| os.path.clone());
+                println!("SCREENSHOT: {}", shown.display());
+                if os.timed_out {
+                    crate::ONESHOT_EXIT_TIMEOUT
+                } else {
+                    0
+                }
+            }
+            Err(e) => {
+                println!("EXCEPTION: oneshot: cannot write {}: {}", os.path.display(), e);
+                1
+            }
+        };
+        crate::ONESHOT_EXIT.store(code, std::sync::atomic::Ordering::SeqCst);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 }
 

@@ -78,34 +78,119 @@ fn with_margin((lo, hi): (f64, f64), frac: f64) -> (f64, f64) {
     (lo - m, hi + m)
 }
 
-/// Union of display-x extents over all renderable groups' visible slices.
-/// Auto-X must fit ALL stacks' data: per-plot native auto would fit each
-/// sub-plot to its own data only and fight the linked x axis.
-fn global_x_extent(data: &PlotData, views: &[Option<GroupView>]) -> Option<(f64, f64)> {
-    let mut ext: Option<(f64, f64)> = None;
-    for (group, view) in data.groups.iter().zip(views) {
-        let Some(v) = view else { continue };
-        // Real min/max, not first/last row: an X column that is not a
-        // timestamp (e.g. a temperature ramping up and down) is unsorted.
-        let Some((lo, hi)) = group.x_extent(v.range) else { continue };
-        let (lo, hi) = (lo + v.offset, hi + v.offset);
-        ext = Some(match ext {
-            None => (lo, hi),
-            Some((a, b)) => (a.min(lo), b.max(hi)),
-        });
-    }
-    ext
+/// A plot axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Axis {
+    X,
+    Y,
 }
 
-/// Y extent (in render space: log10 under log scale) of the visible series
-/// belonging to `stack_id`, over their visible slices.
-fn stack_y_extent(
+/// Visit one series' visible slice in render space exactly as it is drawn:
+/// `Some([x, y])` per plotted point, `None` where the line breaks. An empty
+/// or non-finite cell breaks the line; under a log scale a non-positive value
+/// is skipped without a break (the line joins across it).
+fn visit_drawn(
+    points: &[(f64, Option<f64>)],
+    offset: f64,
+    is_log_scale: bool,
+    mut f: impl FnMut(Option<[f64; 2]>),
+) {
+    for &(x, y_opt) in points {
+        match y_opt {
+            Some(y) if y.is_finite() => {
+                let y_render = if is_log_scale {
+                    if y > 0.0 { y.log10() } else { continue; }
+                } else {
+                    y
+                };
+                f(Some([x + offset, y_render]));
+            }
+            _ => f(None),
+        }
+    }
+}
+
+/// Grow a min/max extent by one value.
+fn extend(ext: &mut Option<(f64, f64)>, v: f64) {
+    *ext = Some(match *ext {
+        None => (v, v),
+        Some((a, b)) => (a.min(v), b.max(v)),
+    });
+}
+
+/// Parameter range `[t0, t1]` within `[0, 1]` over which `a + (b - a)·t`
+/// stays inside `[lo, hi]`; None when the segment never enters it.
+fn clip_param(a: f64, b: f64, lo: f64, hi: f64) -> Option<(f64, f64)> {
+    let d = b - a;
+    if d == 0.0 {
+        return (a >= lo && a <= hi).then_some((0.0, 1.0));
+    }
+    let (t0, t1) = ((lo - a) / d, (hi - a) / d);
+    let (t0, t1) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
+    let (t0, t1) = (t0.max(0.0), t1.min(1.0));
+    (t0 <= t1).then_some((t0, t1))
+}
+
+/// Grow `ext` by the extent along `fit` of the geometry drawn for one series
+/// slice, limited to where the other axis lies within `band` (None = no
+/// limit). Line segments are clipped to the band, so a line crossing it
+/// contributes the part inside even when both of its points lie outside.
+fn drawn_extent(
+    points: &[(f64, Option<f64>)],
+    offset: f64,
+    is_log_scale: bool,
+    fit: Axis,
+    band: Option<(f64, f64)>,
+    ext: &mut Option<(f64, f64)>,
+) {
+    // (index of the fitted coordinate, index of the band coordinate)
+    let (fi, bi) = match fit {
+        Axis::X => (0, 1),
+        Axis::Y => (1, 0),
+    };
+    let mut prev: Option<[f64; 2]> = None;
+    visit_drawn(points, offset, is_log_scale, |p| {
+        let Some(p) = p else {
+            prev = None;
+            return;
+        };
+        match band {
+            None => extend(ext, p[fi]),
+            Some((lo, hi)) => {
+                // A lone point (no segment on either side) counts on its own.
+                if p[bi] >= lo && p[bi] <= hi {
+                    extend(ext, p[fi]);
+                }
+                if let Some(q) = prev {
+                    if let Some((t0, t1)) = clip_param(q[bi], p[bi], lo, hi) {
+                        extend(ext, q[fi] + (p[fi] - q[fi]) * t0);
+                        extend(ext, q[fi] + (p[fi] - q[fi]) * t1);
+                    }
+                }
+            }
+        }
+        prev = Some(p);
+    });
+}
+
+/// Auto-fit extent along `fit` (render space: log10 Y under a log scale) of
+/// the visible series belonging to `stack_id`, over their visible slices,
+/// limited to `band` on the other axis.
+///
+/// With both axes on auto there is no band: the extent is everything drawn.
+/// With only one auto axis, the band is the range the other (manual) axis
+/// currently shows, so data that cannot appear on screen anyway does not
+/// stretch the auto axis — it trims to what is drawn inside the band and
+/// still grows as new data arrives there.
+fn stack_extent(
     data: &PlotData,
     views: &[Option<GroupView>],
     series_stacks: &[usize],
     series_visible: &[bool],
     stack_id: usize,
     is_log_scale: bool,
+    fit: Axis,
+    band: Option<(f64, f64)>,
 ) -> Option<(f64, f64)> {
     let mut ext: Option<(f64, f64)> = None;
     let mut flat_idx = 0usize;
@@ -123,18 +208,14 @@ fn stack_y_extent(
             let Some(v) = view else { continue };
             let start = v.range.0.min(series.points.len());
             let end = v.range.1.min(series.points.len());
-            for &(_, y_opt) in &series.points[start..end] {
-                let Some(y) = y_opt else { continue };
-                let y_render = if is_log_scale {
-                    if y > 0.0 { y.log10() } else { continue; }
-                } else {
-                    y
-                };
-                ext = Some(match ext {
-                    None => (y_render, y_render),
-                    Some((a, b)) => (a.min(y_render), b.max(y_render)),
-                });
-            }
+            drawn_extent(
+                &series.points[start..end],
+                v.offset,
+                is_log_scale,
+                fit,
+                band,
+                &mut ext,
+            );
         }
     }
     ext
@@ -415,20 +496,52 @@ impl eframe::App for PlotApp {
             let auto_x = self.toolbar.auto_x;
             let auto_y = self.toolbar.auto_y;
 
-            // Manual auto-fit extents (see global_x_extent for why not native)
-            let global_x = global_x_extent(&self.data, &views);
+            // Manual auto-fit extents. X spans the union of every stack: a
+            // native per-plot auto would fit each sub-plot to its own data
+            // only and fight the linked x axis. With exactly one axis on
+            // auto, each stack's fit is limited to the band its manual axis
+            // showed last frame (see stack_extent). No extent = the axis
+            // keeps its last range.
+            let extent = |stack_id: usize, fit: Axis, band: Option<(f64, f64)>| {
+                stack_extent(
+                    &self.data,
+                    &views,
+                    &self.series_stacks,
+                    &self.series_visible,
+                    stack_id,
+                    is_log_scale,
+                    fit,
+                    band,
+                )
+            };
+            let mut global_x: Option<(f64, f64)> = None;
+            if auto_x {
+                for (r, &stack_id) in self.stacks.iter().enumerate() {
+                    let band = if auto_y {
+                        None
+                    } else {
+                        self.current_bounds[r].map(|c| (c.2, c.3))
+                    };
+                    if let Some((lo, hi)) = extent(stack_id, Axis::X, band) {
+                        extend(&mut global_x, lo);
+                        extend(&mut global_x, hi);
+                    }
+                }
+            }
             let stack_y: Vec<Option<(f64, f64)>> = self
                 .stacks
                 .iter()
-                .map(|&s| {
-                    stack_y_extent(
-                        &self.data,
-                        &views,
-                        &self.series_stacks,
-                        &self.series_visible,
-                        s,
-                        is_log_scale,
-                    )
+                .enumerate()
+                .map(|(r, &stack_id)| {
+                    if !auto_y {
+                        return None;
+                    }
+                    let band = if auto_x {
+                        None
+                    } else {
+                        self.current_bounds[r].map(|c| (c.0, c.1))
+                    };
+                    extent(stack_id, Axis::Y, band)
                 })
                 .collect();
 
@@ -528,9 +641,6 @@ impl eframe::App for PlotApp {
                     // left to the plot's own memory, so a gesture applied to
                     // it (zoom / pan / the linked x axis) survives.
                     //
-                    // Manual auto-fit for X: it spans the union of all stacks'
-                    // data (native per-plot auto would fit each sub-plot to
-                    // its own data and fight the linked x axis).
                     if auto_x {
                         if let Some(e) = global_x {
                             let (x0, x1) = with_margin(e, AUTO_MARGIN);
@@ -583,27 +693,17 @@ impl eframe::App for PlotApp {
                                 None => series.name.clone(),
                             };
 
-                            // Build line segments, skipping None values (line breaks)
+                            // Build line segments (same rules as the auto-fit)
                             let mut segments: Vec<Vec<[f64; 2]>> = Vec::new();
                             let mut current_segment: Vec<[f64; 2]> = Vec::new();
-
-                            for &(x, y_opt) in points_slice {
-                                match y_opt {
-                                    Some(y) => {
-                                        let y_render = if is_log_scale {
-                                            if y > 0.0 { y.log10() } else { continue; }
-                                        } else {
-                                            y
-                                        };
-                                        current_segment.push([x + view.offset, y_render]);
-                                    }
-                                    None => {
-                                        if !current_segment.is_empty() {
-                                            segments.push(std::mem::take(&mut current_segment));
-                                        }
+                            visit_drawn(points_slice, view.offset, is_log_scale, |p| match p {
+                                Some(p) => current_segment.push(p),
+                                None => {
+                                    if !current_segment.is_empty() {
+                                        segments.push(std::mem::take(&mut current_segment));
                                     }
                                 }
-                            }
+                            });
                             if !current_segment.is_empty() {
                                 segments.push(current_segment);
                             }
@@ -938,7 +1038,133 @@ impl PlotApp {
 
 #[cfg(test)]
 mod tests {
-    use super::dedupe_series_names;
+    use super::{clip_param, dedupe_series_names, drawn_extent, stack_extent, Axis};
+    use crate::plot_state::PlotData;
+
+    fn pts(v: &[(f64, Option<f64>)]) -> Vec<(f64, Option<f64>)> {
+        v.to_vec()
+    }
+
+    fn fit(
+        p: &[(f64, Option<f64>)],
+        log: bool,
+        axis: Axis,
+        band: Option<(f64, f64)>,
+    ) -> Option<(f64, f64)> {
+        let mut ext = None;
+        drawn_extent(p, 0.0, log, axis, band, &mut ext);
+        ext
+    }
+
+    #[test]
+    fn clip_param_cases() {
+        // Fully inside, entering, leaving, crossing, missing, reversed.
+        assert_eq!(clip_param(1.0, 2.0, 0.0, 3.0), Some((0.0, 1.0)));
+        assert_eq!(clip_param(-1.0, 1.0, 0.0, 3.0), Some((0.5, 1.0)));
+        assert_eq!(clip_param(10.0, 0.0, 0.0, 5.0), Some((0.5, 1.0)));
+        assert_eq!(clip_param(-2.0, 6.0, 0.0, 4.0), Some((0.25, 0.75)));
+        assert_eq!(clip_param(5.0, 6.0, 0.0, 4.0), None);
+        // Flat segment: inside or not at all.
+        assert_eq!(clip_param(2.0, 2.0, 0.0, 4.0), Some((0.0, 1.0)));
+        assert_eq!(clip_param(9.0, 9.0, 0.0, 4.0), None);
+    }
+
+    #[test]
+    fn unbanded_fit_spans_every_drawn_point() {
+        let p = pts(&[(0.0, Some(300.0)), (10.0, Some(4.0)), (20.0, None), (30.0, Some(4.5))]);
+        assert_eq!(fit(&p, false, Axis::X, None), Some((0.0, 30.0)));
+        assert_eq!(fit(&p, false, Axis::Y, None), Some((4.0, 300.0)));
+    }
+
+    #[test]
+    fn auto_x_trims_to_the_y_band() {
+        // Cool-down 300 K -> 4 K; only the 4 K wobble lies in the 3..5 band.
+        let p = pts(&[
+            (0.0, Some(300.0)),
+            (100.0, Some(150.0)),
+            (200.0, Some(5.0)),
+            (210.0, Some(4.1)),
+            (220.0, Some(3.9)),
+            (230.0, Some(4.2)),
+        ]);
+        assert_eq!(fit(&p, false, Axis::X, Some((3.0, 5.0))), Some((200.0, 230.0)));
+    }
+
+    #[test]
+    fn a_line_crossing_the_band_counts_between_outside_points() {
+        // 10 K at x=0 to 2 K at x=8: the line is inside 3..5 for x in [5, 7].
+        let p = pts(&[(0.0, Some(10.0)), (8.0, Some(2.0))]);
+        assert_eq!(fit(&p, false, Axis::X, Some((3.0, 5.0))), Some((5.0, 7.0)));
+    }
+
+    #[test]
+    fn a_line_break_is_not_bridged() {
+        // The gap between (0, 10) and (8, 2) is an empty cell: no line there.
+        let p = pts(&[(0.0, Some(10.0)), (4.0, None), (8.0, Some(2.0))]);
+        assert_eq!(fit(&p, false, Axis::X, Some((3.0, 5.0))), None);
+        // Non-finite values break the line too.
+        let p = pts(&[(0.0, Some(10.0)), (4.0, Some(f64::NAN)), (8.0, Some(2.0))]);
+        assert_eq!(fit(&p, false, Axis::X, Some((3.0, 5.0))), None);
+    }
+
+    #[test]
+    fn empty_band_yields_no_extent() {
+        let p = pts(&[(0.0, Some(300.0)), (10.0, Some(200.0))]);
+        assert_eq!(fit(&p, false, Axis::X, Some((3.0, 5.0))), None);
+    }
+
+    #[test]
+    fn lone_point_inside_the_band_counts() {
+        let p = pts(&[(0.0, Some(300.0)), (5.0, None), (7.0, Some(4.0)), (8.0, None)]);
+        assert_eq!(fit(&p, false, Axis::X, Some((3.0, 5.0))), Some((7.0, 7.0)));
+    }
+
+    #[test]
+    fn auto_y_trims_to_the_x_band() {
+        let p = pts(&[(0.0, Some(300.0)), (10.0, Some(5.0)), (20.0, Some(4.0)), (30.0, Some(4.4))]);
+        // Band [15, 30]: the 5 -> 4 segment enters at x=15 (y=4.5).
+        assert_eq!(fit(&p, false, Axis::Y, Some((15.0, 30.0))), Some((4.0, 4.5)));
+    }
+
+    #[test]
+    fn log_scale_fits_in_log_space_and_joins_over_non_positive() {
+        // 0 and -1 are skipped without a break: 100 joins straight to 1.
+        let p = pts(&[(0.0, Some(100.0)), (1.0, Some(0.0)), (2.0, Some(-1.0)), (4.0, Some(1.0))]);
+        assert_eq!(fit(&p, true, Axis::Y, None), Some((0.0, 2.0)));
+        // log band [0.5, 1.5] (≈3.2..31.6): crossing of the 100 -> 1 line.
+        let (lo, hi) = fit(&p, true, Axis::X, Some((0.5, 1.5))).unwrap();
+        assert!((lo - 1.0).abs() < 1e-12 && (hi - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn unsorted_x_trims_by_the_band_too() {
+        // X ramps up then back down; only the middle stretch is in band.
+        let p = pts(&[(50.0, Some(10.0)), (60.0, Some(4.0)), (40.0, Some(4.0)), (30.0, Some(10.0))]);
+        // Lines leave the band at y = 5: x = 58.33 (into the stretch) is
+        // inside it, x = 38.33 (out of it) extends the extent past 40.
+        let (lo, hi) = fit(&p, false, Axis::X, Some((3.0, 5.0))).unwrap();
+        assert!((lo - (40.0 - 10.0 / 6.0)).abs() < 1e-9, "{lo}");
+        assert_eq!(hi, 60.0);
+    }
+
+    #[test]
+    fn stack_extent_skips_hidden_series_and_other_stacks() {
+        let mut d = PlotData::new(true);
+        d.add_group(&["a".into(), "b".into(), "c".into()], false);
+        d.push_row(0, 0.0, None, &[Some(1.0), Some(100.0), Some(-50.0)]);
+        d.push_row(0, 10.0, None, &[Some(2.0), Some(200.0), Some(-60.0)]);
+        let views = d.views(1000, 1e9);
+        let stacks = [1, 1, 2];
+        // Series b hidden: stack 1 fits only a.
+        let visible = [true, false, true];
+        let e = stack_extent(&d, &views, &stacks, &visible, 1, false, Axis::Y, None);
+        assert_eq!(e, Some((1.0, 2.0)));
+        let e = stack_extent(&d, &views, &stacks, &visible, 2, false, Axis::Y, None);
+        assert_eq!(e, Some((-60.0, -50.0)));
+        // Everything hidden: nothing to fit (the axis keeps its last range).
+        let e = stack_extent(&d, &views, &stacks, &[false; 3], 1, false, Axis::X, None);
+        assert_eq!(e, None);
+    }
 
     fn to_groups(v: &[&[&str]]) -> Vec<Vec<String>> {
         v.iter()

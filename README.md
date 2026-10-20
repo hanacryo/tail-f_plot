@@ -14,6 +14,7 @@ Built with [egui](https://github.com/emilk/egui) and [egui_plot](https://github.
 - **Multiple files**: Overlay several files on the same axes with `--` separators, including epoch-time alignment for recordings that started at different times.
 - **Vertical stacks**: Split series into vertically stacked sub-plots (`--y-stacks`) with per-stack Y units, a linked X axis (pan/zoom in sync), and one hover driving the crosshair and tooltip across every sub-plot.
 - **Interactive zoom/pan**: Scroll-wheel zoom, drag pan, box zoom-in, click zoom-out.
+- **Auto-X / Auto-Y**: Each axis can follow the data on its own. With only one of them on, it fits just the lines drawn inside the other axis' current range — e.g. zoom Y to 3–5 K during a cool-down from 300 K, turn Auto-X on, and the time axis trims to where the trace is inside that band (still growing as new rows arrive) instead of spanning the empty hours above it. Hidden series (legend click) are ignored. When nothing is drawn in that range, the axis keeps its last range.
 - **Log scale**: Toggle Y-axis log scale at runtime.
 - **Multi-monitor DPI aware**: Per-monitor DPI v2 support with work-area-percentage window placement.
 - **Zero config**: All settings via CLI arguments. No config files needed.

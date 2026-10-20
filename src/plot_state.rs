@@ -41,35 +41,6 @@ pub struct FileGroup {
     pub x_sorted: bool,
 }
 
-impl FileGroup {
-    /// Min/max stored x (offset not applied) over the row range `range`.
-    /// O(1) while `x_sorted`, a scan otherwise. None when the range is empty
-    /// or holds no finite x.
-    pub fn x_extent(&self, range: (usize, usize)) -> Option<(f64, f64)> {
-        let first = self.series.first()?;
-        let start = range.0.min(first.points.len());
-        let end = range.1.min(first.points.len());
-        if start >= end {
-            return None;
-        }
-        if self.x_sorted {
-            return Some((first.points[start].0, first.points[end - 1].0));
-        }
-        let mut lo = f64::INFINITY;
-        let mut hi = f64::NEG_INFINITY;
-        for &(x, _) in &first.points[start..end] {
-            if x < lo {
-                lo = x;
-            }
-            if x > hi {
-                hi = x;
-            }
-        }
-        // NaN-only ranges leave the sentinels untouched.
-        (lo <= hi).then_some((lo, hi))
-    }
-}
-
 /// Per-group render info: the visible index range on the group's row-aligned
 /// point buffers, plus the constant display offset added to stored x values.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -340,33 +311,6 @@ mod tests {
         assert!(!d.groups[0].x_sorted);
         d.push_row(0, 99.0, None, &[Some(1.0)]);
         assert!(!d.groups[0].x_sorted); // never goes back
-    }
-
-    #[test]
-    fn x_extent_is_real_min_max_when_unsorted() {
-        let mut d = PlotData::new(true);
-        d.add_group(&names(1), false);
-        // Ramps up then down: first/last row are neither min nor max.
-        for x in [30.0, 50.0, 20.0, 40.0] {
-            d.push_row(0, x, None, &[Some(1.0)]);
-        }
-        let g = &d.groups[0];
-        assert!(!g.x_sorted);
-        assert_eq!(g.x_extent((0, 4)), Some((20.0, 50.0)));
-        // Sub-range only
-        assert_eq!(g.x_extent((0, 2)), Some((30.0, 50.0)));
-        assert_eq!(g.x_extent((2, 2)), None);
-    }
-
-    #[test]
-    fn x_extent_uses_endpoints_while_sorted() {
-        let mut d = PlotData::new(true);
-        d.add_group(&names(1), false);
-        for x in [10.0, 20.0, 30.0] {
-            d.push_row(0, x, None, &[Some(1.0)]);
-        }
-        assert_eq!(d.groups[0].x_extent((0, 3)), Some((10.0, 30.0)));
-        assert_eq!(d.groups[0].x_extent((1, 3)), Some((20.0, 30.0)));
     }
 
     #[test]

@@ -701,12 +701,15 @@ impl eframe::App for PlotApp {
                             // Latest value for legend display name
                             let latest_value = points_slice.iter().rev().find_map(|(_, y)| *y);
                             let legend_name = match latest_value {
-                                Some(v) => format!(
-                                    "{} : {}({})",
-                                    series.name,
-                                    crate::tooltip::format_series_value(v, is_log_scale),
-                                    unit
-                                ),
+                                Some(v) => {
+                                    let value =
+                                        crate::tooltip::format_series_value(v, is_log_scale);
+                                    if unit.is_empty() {
+                                        format!("{} : {}", series.name, value)
+                                    } else {
+                                        format!("{} : {}({})", series.name, value, unit)
+                                    }
+                                }
                                 None => series.name.clone(),
                             };
 

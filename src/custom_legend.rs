@@ -105,7 +105,9 @@ pub fn render_legend(
                                 crate::tooltip::format_series_value(v, is_log_scale);
                             job.append(" : ", 0.0, normal_fmt.clone());
                             job.append(&display_val, 0.0, bold_fmt);
-                            job.append(&format!("({})", y_unit), 0.0, normal_fmt);
+                            if !y_unit.is_empty() {
+                                job.append(&format!("({})", y_unit), 0.0, normal_fmt);
+                            }
                         }
 
                         legend_ui.horizontal(|ui| {

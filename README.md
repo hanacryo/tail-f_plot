@@ -8,7 +8,7 @@ Built with [egui](https://github.com/emilk/egui) and [egui_plot](https://github.
 
 ## Features
 
-- **Live tail**: Watches the file via OS notifications and redraws automatically.
+- **Live tail**: Watches the file via OS notifications (polling as a fallback) and redraws automatically. Like `tail`, a file is read from its end: only the newest `--max-points` rows are read and kept, so a huge file opens instantly and memory stays bounded however long it runs. The file is not held open between reads, and a file that is replaced, truncated or rewritten is re-read from scratch.
 - **Flexible CSV parsing**: Configurable delimiter (comma, tab, semicolon, space, pipe), quoted fields, merged delimiters, fixed-width columns.
 - **Multiple Y series**: Plot any combination of columns on a single chart.
 - **Multiple files**: Overlay several files on the same axes with `--` separators, including epoch-time alignment for recordings that started at different times.
@@ -171,7 +171,7 @@ With `--oneshot <PNG_PATH>` the window renders once, saves a screenshot and exit
 | `--marker-radius <F>` | `4.0` | Data point marker radius |
 | `--oneshot <PNG_PATH>` | | Render once, save a PNG screenshot, exit (see stdout status) |
 
-> **`--max-points` / `--max-x-range`:** Both limit the visible window. The stricter of the two applies (per file in multi-file mode). The X window is anchored at the newest row: `--max-x-range` keeps the rows back to the first one whose X leaves the window. This works for an X column that is not a timestamp too (e.g. `R` against a temperature that ramps up and down) — auto-fit then spans the column's true min/max, not the first and last row.
+> **`--max-points` / `--max-x-range`:** Both limit the visible window. The stricter of the two applies (per file in multi-file mode). The X window is anchored at the newest row: `--max-x-range` keeps the rows back to the first one whose X leaves the window. This works for an X column that is not a timestamp too (e.g. `R` against a temperature that ramps up and down) — auto-fit then spans the column's true min/max, not the first and last row. Only the newest `--max-points` rows of each file are read and kept in memory at all.
 
 ## Multiple Files
 
@@ -233,7 +233,7 @@ The tool expects a text file with:
 2. Numeric data in the specified columns
 3. New rows appended over time (tail-f behavior)
 
-Empty cells produce gaps in the line (no interpolation).
+Empty cells produce gaps in the line (no interpolation). Lines end with LF or CRLF; a last line without its newline waits until it is complete. A UTF-8 BOM is ignored, and text that is not UTF-8 (e.g. a CP949 comment column) does not affect the numeric columns. When the file disappears the plot keeps its rows until the file comes back.
 
 ## License
 

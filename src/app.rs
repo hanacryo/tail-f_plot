@@ -5,7 +5,7 @@ use eframe::egui;
 use egui::{PointerButton, Vec2b};
 use egui_plot::{Line, MarkerShape, Plot, PlotPoint, PlotPoints, PlotResponse, Points};
 
-use crate::csv_watcher::CsvWatcher;
+use crate::csv_watcher::{CsvWatcher, LoadPolicy};
 use crate::custom_legend::LegendEntry;
 use crate::groups::GroupConfig;
 use crate::plot_state::{GroupView, PlotData, PlotMode};
@@ -221,6 +221,23 @@ fn stack_extent(
     ext
 }
 
+/// What group `gi`'s watcher must read besides the newest `--max-points`
+/// rows (see `PlotData::offset` for how origin and anchors are used).
+fn load_policy(groups: &[GroupConfig], gi: usize, cli: &Cli) -> LoadPolicy {
+    let epoch = |g: &GroupConfig| g.epochtime_col > 0;
+    let aligned = !cli.absolute_x && epoch(&groups[0]);
+    LoadPolicy {
+        keep_rows: cli.max_points.max(1),
+        // Only the first file's origin is the shared display origin.
+        need_origin: gi == 0 && !cli.absolute_x,
+        // A later file aligns its first epoch to the first file's; the
+        // first file's anchor matters only if some later file uses it.
+        need_anchor: aligned
+            && epoch(&groups[gi])
+            && (gi > 0 || groups[1..].iter().any(epoch)),
+    }
+}
+
 /// Deduplicate series names across all groups (flat order): the first
 /// occurrence keeps its name, later ones get "(2)", "(3)", ... suffixes.
 /// Covers inherited --y-names, explicit duplicates, and the same file
@@ -353,11 +370,11 @@ impl PlotApp {
 
         let mut data = PlotData::new(cli.absolute_x);
         let mut watchers = Vec::new();
-        for (cfg, names) in groups.iter().zip(&group_names) {
+        for (gi, (cfg, names)) in groups.iter().zip(&group_names).enumerate() {
             data.add_group(names, cfg.epochtime_col > 0);
 
-            let mut watcher = CsvWatcher::new(cfg);
-            watcher.start();
+            let mut watcher = CsvWatcher::new(cfg, load_policy(&groups, gi, &cli));
+            watcher.start(&cc.egui_ctx);
             watchers.push(watcher);
         }
         let series_total = data.series_count();

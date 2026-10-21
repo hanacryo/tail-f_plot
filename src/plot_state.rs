@@ -77,6 +77,54 @@ impl PlotData {
         self.groups.iter().map(|g| g.series.len()).sum()
     }
 
+    /// Forget everything read for a group (its file was replaced, truncated
+    /// or rewritten): rows, origin, epoch anchor and sorted-x tracking.
+    pub fn reset_group(&mut self, group: usize) {
+        let g = &mut self.groups[group];
+        for s in &mut g.series {
+            s.points.clear();
+        }
+        g.origin_x = None;
+        g.epoch_anchor = None;
+        g.x_sorted = true;
+    }
+
+    /// Set a group's origin / epoch anchor found in rows that are not loaded
+    /// (the head of a file read from its tail). Already-set values win, as in
+    /// `push_row`, so call this before pushing the loaded rows.
+    pub fn seed_group(&mut self, group: usize, origin_x: Option<f64>, epoch_anchor: Option<(f64, f64)>) {
+        let g = &mut self.groups[group];
+        if g.origin_x.is_none() {
+            g.origin_x = origin_x;
+        }
+        if g.epoch_expected && g.epoch_anchor.is_none() {
+            g.epoch_anchor = epoch_anchor;
+        }
+    }
+
+    /// Whether a group still lacks its origin / epoch anchor.
+    pub fn needs_seed(&self, group: usize) -> (bool, bool) {
+        let g = &self.groups[group];
+        (g.origin_x.is_none(), g.epoch_expected && g.epoch_anchor.is_none())
+    }
+
+    /// Drop a group's oldest rows so at most `keep` remain. Rows beyond the
+    /// newest `max_points` are never rendered (`views` starts at least at
+    /// `total - max_points`) and the origin / epoch anchor are stored apart,
+    /// so this changes nothing on screen. Amortized: rows are only drained
+    /// once the excess reaches `max(keep, 1024)`.
+    pub fn evict_old_rows(&mut self, group: usize, keep: usize) {
+        let g = &mut self.groups[group];
+        let len = g.series.first().map_or(0, |s| s.points.len());
+        if len <= keep.saturating_add(keep.max(1024)) {
+            return;
+        }
+        let drop = len - keep;
+        for s in &mut g.series {
+            s.points.drain(..drop);
+        }
+    }
+
     /// Push one row into a group. `x` and `epoch` have their proportions
     /// already applied.
     pub fn push_row(&mut self, group: usize, x: f64, epoch: Option<f64>, y_values: &[Option<f64>]) {

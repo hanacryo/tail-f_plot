@@ -7,6 +7,7 @@ mod app;
 mod csv_watcher;
 mod custom_legend;
 mod groups;
+mod icons;
 mod plot_state;
 mod toolbar;
 mod tooltip;

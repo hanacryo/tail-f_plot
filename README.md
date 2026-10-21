@@ -224,7 +224,7 @@ tail-f_plot.exe temp.csv --y-cols 5 --y-names Temp --y-stacks 1 --y-units K,A,V 
 |-------|--------|
 | Scroll wheel | Zoom in/out |
 | Drag | Pan (in default mode) |
-| Toolbar buttons | Home, Zoom In (box), Zoom Out (click), Auto X/Y, Log scale, Legend position |
+| Toolbar buttons | Home, Zoom In (box), Zoom Out (click), Auto X/Y, Log scale (the icon shows the current scale), Legend position. Hover a button for its tooltip |
 
 ## Data Format
 

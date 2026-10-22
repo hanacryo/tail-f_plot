@@ -10,6 +10,7 @@ mod custom_legend;
 mod groups;
 mod icons;
 mod plot_state;
+mod settings;
 mod toolbar;
 mod tooltip;
 
@@ -359,6 +360,11 @@ pub struct Cli {
     /// Render once, save a PNG screenshot of the window to this path, exit
     #[arg(long)]
     oneshot: Option<PathBuf>,
+
+    /// With --oneshot: also open the settings window on this tab (display,
+    /// files, window, command-line) and save it as `<PNG stem>-settings.png`
+    #[arg(long, requires = "oneshot", value_parser = ["display", "files", "window", "command-line"])]
+    oneshot_settings: Option<String>,
 }
 
 /// Resolve delimiter name to actual string
@@ -430,7 +436,9 @@ fn help_text() -> String {
         --max-x-range <F>          Max X range [default: 120.0]\n\
           (max-points / max-x-range: stricter of the two applies)\n\
         --marker-radius <F>        Marker radius [default: 4.0]\n\
-        --oneshot <PNG_PATH>       Render once, save a screenshot, exit\n\n\
+        --oneshot <PNG_PATH>       Render once, save a screenshot, exit\n\
+        --oneshot-settings <TAB>   With --oneshot: also capture the settings window\n\
+        \x20                          (display|files|window|command-line)\n\n\
         Multi-file:\n\
         `--` starts a new file group plotted on the same axes. Omitted options\n\
         (even the file path) inherit from the previous group. Per-group options:\n\
@@ -491,6 +499,157 @@ pub fn parse_color(s: &str) -> Option<[u8; 3]> {
     let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
     let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
     Some([r, g, b])
+}
+
+/// Window title: unique file names (order kept) + explicit legend names
+pub fn window_title(group_cfgs: &[groups::GroupConfig]) -> String {
+    let mut file_names: Vec<String> = Vec::new();
+    for cfg in group_cfgs {
+        let name = cfg
+            .csv_path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !file_names.contains(&name) {
+            file_names.push(name);
+        }
+    }
+    let files_str = file_names.join(" + ");
+
+    let mut names: Vec<String> = Vec::new();
+    for cfg in group_cfgs {
+        for n in &cfg.y_names {
+            if !names.contains(n) {
+                names.push(n.clone());
+            }
+        }
+    }
+    let names_str = names.join(",");
+    if names_str.is_empty() {
+        format!("{} - HANA tail-f_plot - v{}", files_str, env!("FULL_VERSION"))
+    } else {
+        format!("{} - {} - HANA tail-f_plot - v{}", names_str, files_str, env!("FULL_VERSION"))
+    }
+}
+
+/// `--bounds` (work-area percentages of `--monitor`, default 0) as a physical
+/// pixel placement [x, y, width, height] for SetWindowPos.
+pub fn physical_placement(cli: &Cli) -> Option<[i32; 4]> {
+    if cli.bounds.len() != 4 {
+        return None;
+    }
+    let mon_idx = cli.monitor.unwrap_or(0);
+    #[cfg(windows)]
+    {
+        get_monitor_work_area(mon_idx).map(|(wl, wt, wr, wb, _dpi, _scale)| {
+            let ww = (wr - wl) as f64;
+            let wh = (wb - wt) as f64;
+            let left = wl + (ww * cli.bounds[0] / 100.0) as i32;
+            let top = wt + (wh * cli.bounds[1] / 100.0) as i32;
+            let right = wl + (ww * cli.bounds[2] / 100.0) as i32;
+            let bottom = wt + (wh * cli.bounds[3] / 100.0) as i32;
+            [left, top, right - left, bottom - top]
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = mon_idx;
+        None
+    }
+}
+
+/// One line per monitor, in `--monitor` index order: "0: 1920 x 1080 (primary)".
+#[cfg(windows)]
+pub fn monitor_labels() -> Vec<String> {
+    use windows_sys::Win32::Foundation::{LPARAM, RECT};
+    use windows_sys::Win32::Graphics::Gdi::*;
+    use windows_sys::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
+
+    unsafe extern "system" fn cb(hmon: HMONITOR, _hdc: HDC, _rect: *mut RECT, data: LPARAM) -> i32 {
+        let vec = &mut *(data as *mut Vec<HMONITOR>);
+        vec.push(hmon);
+        1 // TRUE
+    }
+    let mut monitors: Vec<HMONITOR> = Vec::new();
+    unsafe {
+        EnumDisplayMonitors(0 as HDC, std::ptr::null(), Some(cb), &mut monitors as *mut _ as LPARAM);
+    }
+    monitors
+        .iter()
+        .enumerate()
+        .map(|(i, &hmon)| {
+            let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+            info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if unsafe { GetMonitorInfoW(hmon, &mut info) } == 0 {
+                return format!("{i}");
+            }
+            let r = info.rcMonitor;
+            let primary = if info.dwFlags & MONITORINFOF_PRIMARY != 0 { " (primary)" } else { "" };
+            format!("{i}: {} x {}{primary}", r.right - r.left, r.bottom - r.top)
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+pub fn monitor_labels() -> Vec<String> {
+    Vec::new()
+}
+
+/// A maximized window keeps its maximized size over a placement: restore it
+/// first (winit picks up the change from WM_SIZE).
+#[cfg(windows)]
+pub fn restore_if_maximized(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, ShowWindow, SW_RESTORE};
+    unsafe {
+        if IsZoomed(hwnd as _) != 0 {
+            ShowWindow(hwnd as _, SW_RESTORE);
+        }
+    }
+}
+
+/// Work area [left, top, right, bottom] of the monitor a window is on.
+#[cfg(windows)]
+pub fn work_area_of(hwnd: isize) -> Option<[i32; 4]> {
+    use windows_sys::Win32::Graphics::Gdi::*;
+    let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    let monitor = unsafe { MonitorFromWindow(hwnd as _, MONITOR_DEFAULTTONEAREST) };
+    if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+        return None;
+    }
+    let r = info.rcWork;
+    Some([r.left, r.top, r.right, r.bottom])
+}
+
+/// Work area [left, top, right, bottom] of monitor `index` (`--monitor`).
+#[cfg(windows)]
+pub fn work_area_of_monitor(index: u32) -> Option<[i32; 4]> {
+    get_monitor_work_area(index).map(|(l, t, r, b, _, _)| [l, t, r, b])
+}
+
+/// Center a window, keeping its size, in a work area [left, top, right,
+/// bottom]. Moving onto a monitor with another DPI resizes the window, so a
+/// second pass centers it again with the new size.
+#[cfg(windows)]
+pub fn center_window(hwnd: isize, work: [i32; 4]) {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    };
+    let [left, top, right, bottom] = work;
+    for _ in 0..2 {
+        let mut r: RECT = unsafe { std::mem::zeroed() };
+        if unsafe { GetWindowRect(hwnd as _, &mut r) } == 0 {
+            return;
+        }
+        let x = left + (right - left - (r.right - r.left)) / 2;
+        let y = top + (bottom - top - (r.bottom - r.top)) / 2;
+        if (r.left, r.top) == (x, y) {
+            break;
+        }
+        let flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
+        unsafe { SetWindowPos(hwnd as _, std::ptr::null_mut(), x, y, 0, 0, flags) };
+    }
 }
 
 /// Get monitor work area (excluding taskbar) + DPI scale factor for given index (0-based).
@@ -582,55 +741,10 @@ fn main() -> eframe::Result {
         }
     }
 
-    // Window title: unique file names (order kept) + explicit legend names
-    let mut file_names: Vec<String> = Vec::new();
-    for cfg in &group_cfgs {
-        let name = cfg
-            .csv_path
-            .file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if !file_names.contains(&name) {
-            file_names.push(name);
-        }
-    }
-    let files_str = file_names.join(" + ");
+    let title = window_title(&group_cfgs);
 
-    let mut names: Vec<String> = Vec::new();
-    for cfg in &group_cfgs {
-        for n in &cfg.y_names {
-            if !names.contains(n) {
-                names.push(n.clone());
-            }
-        }
-    }
-    let names_str = names.join(",");
-    let title = if names_str.is_empty() {
-        format!("{} - HANA tail-f_plot - v{}", files_str, env!("FULL_VERSION"))
-    } else {
-        format!("{} - {} - HANA tail-f_plot - v{}", names_str, files_str, env!("FULL_VERSION"))
-    };
-
-    // Compute physical pixel placement when --bounds is specified (for SetWindowPos)
-    let physical_placement: Option<[i32; 4]> = if cli.bounds.len() == 4 {
-        let mon_idx = cli.monitor.unwrap_or(0);
-        #[cfg(windows)]
-        {
-            get_monitor_work_area(mon_idx).map(|(wl, wt, wr, wb, _dpi, _scale)| {
-                let ww = (wr - wl) as f64;
-                let wh = (wb - wt) as f64;
-                let left = wl + (ww * cli.bounds[0] / 100.0) as i32;
-                let top = wt + (wh * cli.bounds[1] / 100.0) as i32;
-                let right = wl + (ww * cli.bounds[2] / 100.0) as i32;
-                let bottom = wt + (wh * cli.bounds[3] / 100.0) as i32;
-                [left, top, right - left, bottom - top]
-            })
-        }
-        #[cfg(not(windows))]
-        { let _ = mon_idx; None }
-    } else {
-        None
-    };
+    // Physical pixel placement when --bounds is specified (for SetWindowPos)
+    let physical_placement = physical_placement(&cli);
 
     let viewport = egui::ViewportBuilder::default()
         .with_title(&title)

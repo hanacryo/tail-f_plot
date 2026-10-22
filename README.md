@@ -170,6 +170,7 @@ With `--oneshot <PNG_PATH>` the window renders once, saves a screenshot and exit
 | `--max-x-range <F>` | `120.0` | Max visible X range after proportion (see note below) |
 | `--marker-radius <F>` | `4.0` | Data point marker radius |
 | `--oneshot <PNG_PATH>` | | Render once, save a PNG screenshot, exit (see stdout status) |
+| `--oneshot-settings <TAB>` | | With `--oneshot`: also open the settings window on `display`, `files`, `window` or `command-line` and save it as `<PNG stem>-settings.png` |
 
 > **`--max-points` / `--max-x-range`:** Both limit the visible window. The stricter of the two applies (per file in multi-file mode). The X window is anchored at the newest row: `--max-x-range` keeps the rows back to the first one whose X leaves the window. This works for an X column that is not a timestamp too (e.g. `R` against a temperature that ramps up and down) — auto-fit then spans the column's true min/max, not the first and last row. Only the newest `--max-points` rows of each file are read and kept in memory at all.
 

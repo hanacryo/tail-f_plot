@@ -12,6 +12,7 @@ pub struct ToolbarState {
     pub log_scale: bool,        // manual log scale toggle
     pub legend_pos: Corner,     // legend position (4 corners)
     pub show_about: bool,       // About modal display flag
+    pub open_settings: bool,    // gear clicked (taken by the app)
     prev_log_scale: bool,       // previous frame log scale state (for change detection)
 }
 
@@ -25,6 +26,7 @@ impl Default for ToolbarState {
             log_scale: false,
             legend_pos: Corner::LeftBottom, // default: bottom-left
             show_about: false,
+            open_settings: false,
             prev_log_scale: false,
         }
     }
@@ -107,6 +109,10 @@ impl ToolbarState {
                     Corner::RightTop => Corner::RightBottom,
                     Corner::RightBottom => Corner::LeftBottom,
                 };
+            }
+
+            if icon_button(ui, Icon::Gear, false, "Settings").clicked() {
+                self.open_settings = true;
             }
 
             // About button at right end

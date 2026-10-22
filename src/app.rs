@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -9,6 +10,7 @@ use crate::csv_watcher::{CsvWatcher, LoadPolicy};
 use crate::custom_legend::LegendEntry;
 use crate::groups::GroupConfig;
 use crate::plot_state::{GroupView, PlotData, PlotMode};
+use crate::settings::SettingsWindow;
 use crate::toolbar::ToolbarState;
 use crate::{Cli, resolve_colors};
 
@@ -46,6 +48,8 @@ const ONESHOT_MIN_FRAMES: u32 = 3;
 /// screenshot, write it as PNG, close.
 struct OneShot {
     path: PathBuf,
+    /// `--oneshot-settings`: where the settings window's capture goes
+    settings_path: Option<PathBuf>,
     started: Instant,
     frames: u32,
     /// Consecutive frames that met every settle condition.
@@ -54,7 +58,33 @@ struct OneShot {
     /// captured frame shows the state that was judged settled.
     requested: bool,
     timed_out: bool,
-    done: bool,
+    /// The main window's capture arrived (written or failed)
+    saved: bool,
+    /// The settings window's capture arrived (written or failed)
+    settings_saved: bool,
+    /// A capture could not be written
+    failed: bool,
+}
+
+impl OneShot {
+    fn finished(&self) -> bool {
+        self.saved && (self.settings_path.is_none() || self.settings_saved)
+    }
+}
+
+/// Write one capture and report it on stdout; false = not written.
+fn write_capture(path: &Path, image: &egui::ColorImage) -> bool {
+    match save_png(path, image) {
+        Ok(()) => {
+            let shown = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+            println!("SCREENSHOT: {}", shown.display());
+            true
+        }
+        Err(e) => {
+            println!("EXCEPTION: oneshot: cannot write {}: {}", path.display(), e);
+            false
+        }
+    }
 }
 
 /// Write a screenshot as an opaque RGBA PNG.
@@ -266,59 +296,23 @@ fn dedupe_series_names(groups: &mut [Vec<String>]) {
     }
 }
 
-pub struct PlotApp {
-    watchers: Vec<CsvWatcher>,
-    data: PlotData,
-    toolbar: ToolbarState,
-    repaint_interval_ms: u64,
-    x_axis_label: String,
-    x_unit: String,
-    line_width: f32,
-    colors: Vec<[u8; 3]>,
-    max_points: usize,
-    max_x_range: f64,
-    marker_radius: f32,
-    /// First group's resolved proportion (used for tooltip time formatting)
-    x_proportion: f64,
+/// Series names, stacks and units the view derives from the settings.
+struct SeriesLayout {
+    /// Legend names per file group, deduplicated across groups
+    names: Vec<Vec<String>>,
+    /// Flat across all groups, in (group, series) order
+    series_stacks: Vec<usize>,
     /// Used stack indices, sorted ascending — one sub-plot per entry
     stacks: Vec<usize>,
     /// Y unit per entry of `stacks`
     stack_units: Vec<String>,
-    /// Flat across all groups, in (group, series) order
-    series_stacks: Vec<usize>,
     series_units: Vec<String>,
-    series_visible: Vec<bool>,
-    /// Shared y-axis width (min_width fed to every sub-plot). Ratchets up to
-    /// the widest measured axis so all frames align pixel-exact; resets on Home.
-    y_axis_width: f32,
-    /// Per stack row: bounds to force on the next frame, per axis. Kept split
-    /// because a gesture usually pins only one axis of one sub-plot — writing
-    /// X on the others would fight the linked x axis.
-    pending_x: Vec<Option<(f64, f64)>>,
-    pending_y: Vec<Option<(f64, f64)>>,
-    /// Per stack row: currently displayed bounds (x_min, x_max, y_min, y_max)
-    current_bounds: Vec<Option<(f64, f64, f64, f64)>>,
-    /// Physical pixel placement for SetWindowPos: [x, y, width, height]
-    target_placement: Option<[i32; 4]>,
-    /// This instance's own root window (HWND as isize)
-    root_hwnd: Option<isize>,
-    placement_applied: bool,
-    oneshot: Option<OneShot>,
 }
 
-impl PlotApp {
-    pub fn new(
-        cc: &eframe::CreationContext<'_>,
-        cli: Cli,
-        groups: Vec<GroupConfig>,
-        target_placement: Option<[i32; 4]>,
-    ) -> Self {
-        crate::register_fonts(&cc.egui_ctx);
-
-        let colors = resolve_colors(&cli.colors);
+impl SeriesLayout {
+    fn new(cli: &Cli, groups: &[GroupConfig]) -> Self {
         let multi_file = groups.len() > 1;
-
-        let mut group_names: Vec<Vec<String>> = groups
+        let mut names: Vec<Vec<String>> = groups
             .iter()
             .map(|cfg| {
                 if cfg.y_names.is_empty() {
@@ -344,11 +338,11 @@ impl PlotApp {
                 }
             })
             .collect();
-        dedupe_series_names(&mut group_names);
+        dedupe_series_names(&mut names);
 
         // Flat per-series stack index ((group, series) order, 1-based)
         let mut series_stacks: Vec<usize> = Vec::new();
-        for (cfg, names) in groups.iter().zip(&group_names) {
+        for (cfg, names) in groups.iter().zip(&names) {
             for i in 0..names.len() {
                 series_stacks.push(cfg.y_stacks.get(i).copied().unwrap_or(1).max(1));
             }
@@ -365,45 +359,122 @@ impl PlotApp {
                 .cloned()
                 .unwrap_or_else(|| cli.y_unit.clone())
         };
-        let stack_units: Vec<String> = stacks.iter().map(|&s| stack_unit(s)).collect();
-        let series_units: Vec<String> = series_stacks.iter().map(|&s| stack_unit(s)).collect();
+        let stack_units = stacks.iter().map(|&s| stack_unit(s)).collect();
+        let series_units = series_stacks.iter().map(|&s| stack_unit(s)).collect();
+        Self { names, series_stacks, stacks, stack_units, series_units }
+    }
+}
 
-        let mut data = PlotData::new(cli.absolute_x);
-        let mut watchers = Vec::new();
-        for (gi, (cfg, names)) in groups.iter().zip(&group_names).enumerate() {
-            data.add_group(names, cfg.epochtime_col > 0);
+/// Start reading every file group from scratch.
+fn load_files(
+    ctx: &egui::Context,
+    cli: &Cli,
+    groups: &[GroupConfig],
+    names: &[Vec<String>],
+) -> (PlotData, Vec<CsvWatcher>) {
+    let mut data = PlotData::new(cli.absolute_x);
+    let mut watchers = Vec::new();
+    for (gi, (cfg, names)) in groups.iter().zip(names).enumerate() {
+        data.add_group(names, cfg.epochtime_col > 0);
 
-            let mut watcher = CsvWatcher::new(cfg, load_policy(&groups, gi, &cli));
-            watcher.start(&cc.egui_ctx);
-            watchers.push(watcher);
-        }
+        let mut watcher = CsvWatcher::new(cfg, load_policy(groups, gi, cli));
+        watcher.start(ctx);
+        watchers.push(watcher);
+    }
+    (data, watchers)
+}
+
+fn x_axis_label(cli: &Cli) -> String {
+    if cli.x_unit.is_empty() {
+        cli.x_axis_label.clone()
+    } else {
+        format!("{} ({})", cli.x_axis_label, cli.x_unit)
+    }
+}
+
+pub struct PlotApp {
+    /// Settings in effect: global options and one config per file group
+    cli: Cli,
+    groups: Vec<GroupConfig>,
+    watchers: Vec<CsvWatcher>,
+    data: PlotData,
+    toolbar: ToolbarState,
+    repaint_interval_ms: u64,
+    x_axis_label: String,
+    x_unit: String,
+    line_width: f32,
+    colors: Vec<[u8; 3]>,
+    max_points: usize,
+    max_x_range: f64,
+    marker_radius: f32,
+    /// First group's resolved proportion (used for tooltip time formatting)
+    x_proportion: f64,
+    /// Used stack indices, sorted ascending — one sub-plot per entry
+    stacks: Vec<usize>,
+    /// Y unit per entry of `stacks`
+    stack_units: Vec<String>,
+    /// Legend names per file group (as loaded into `data`)
+    series_names: Vec<Vec<String>>,
+    /// Flat across all groups, in (group, series) order
+    series_stacks: Vec<usize>,
+    series_units: Vec<String>,
+    series_visible: Vec<bool>,
+    /// Shared y-axis width (min_width fed to every sub-plot). Ratchets up to
+    /// the widest measured axis so all frames align pixel-exact; resets on Home.
+    y_axis_width: f32,
+    /// Per stack row: bounds to force on the next frame, per axis. Kept split
+    /// because a gesture usually pins only one axis of one sub-plot — writing
+    /// X on the others would fight the linked x axis.
+    pending_x: Vec<Option<(f64, f64)>>,
+    pending_y: Vec<Option<(f64, f64)>>,
+    /// Per stack row: currently displayed bounds (x_min, x_max, y_min, y_max)
+    current_bounds: Vec<Option<(f64, f64, f64, f64)>>,
+    /// Physical pixel placement for SetWindowPos: [x, y, width, height]
+    target_placement: Option<[i32; 4]>,
+    /// This instance's own root window (HWND as isize)
+    root_hwnd: Option<isize>,
+    placement_applied: bool,
+    oneshot: Option<OneShot>,
+    settings: SettingsWindow,
+    /// `--oneshot-settings` tab, opened on the first pass
+    oneshot_settings_tab: Option<String>,
+}
+
+impl PlotApp {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        cli: Cli,
+        groups: Vec<GroupConfig>,
+        target_placement: Option<[i32; 4]>,
+    ) -> Self {
+        crate::register_fonts(&cc.egui_ctx);
+
+        let layout = SeriesLayout::new(&cli, &groups);
+        let (data, watchers) = load_files(&cc.egui_ctx, &cli, &groups, &layout.names);
         let series_total = data.series_count();
 
         let mut toolbar = ToolbarState::default();
         toolbar.set_log_scale(cli.log_y);
 
-        let n_stacks = stacks.len();
+        let n_stacks = layout.stacks.len();
         Self {
             watchers,
             data,
             toolbar,
             repaint_interval_ms: cli.repaint_interval_ms,
-            x_axis_label: if cli.x_unit.is_empty() {
-                cli.x_axis_label.clone()
-            } else {
-                format!("{} ({})", cli.x_axis_label, cli.x_unit)
-            },
-            x_unit: cli.x_unit,
+            x_axis_label: x_axis_label(&cli),
+            x_unit: cli.x_unit.clone(),
             line_width: cli.line_width,
-            colors,
+            colors: resolve_colors(&cli.colors),
             max_points: cli.max_points,
             max_x_range: cli.max_x_range,
             marker_radius: cli.marker_radius,
             x_proportion: groups[0].x_proportion,
-            stacks,
-            stack_units,
-            series_stacks,
-            series_units,
+            stacks: layout.stacks,
+            stack_units: layout.stack_units,
+            series_names: layout.names,
+            series_stacks: layout.series_stacks,
+            series_units: layout.series_units,
             series_visible: vec![true; series_total],
             y_axis_width: Y_AXIS_MIN_WIDTH,
             pending_x: vec![None; n_stacks],
@@ -412,16 +483,107 @@ impl PlotApp {
             target_placement,
             root_hwnd: crate::native_hwnd(cc),
             placement_applied: false,
-            oneshot: cli.oneshot.map(|path| OneShot {
+            oneshot: cli.oneshot.clone().map(|path| OneShot {
+                settings_path: cli.oneshot_settings.as_ref().map(|_| {
+                    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                    path.with_file_name(format!("{stem}-settings.png"))
+                }),
                 path,
                 started: Instant::now(),
                 frames: 0,
                 stable: 0,
                 requested: false,
                 timed_out: false,
-                done: false,
+                saved: false,
+                settings_saved: false,
+                failed: false,
             }),
+            settings: SettingsWindow::new(Arc::new(crate::load_icon())),
+            oneshot_settings_tab: cli.oneshot_settings.clone(),
+            cli,
+            groups,
         }
+    }
+
+    /// Apply settings from the settings window. Files are read again only
+    /// when what is read changes (file groups, --max-points, --absolute-x);
+    /// everything else applies in place.
+    fn apply_config(&mut self, ctx: &egui::Context, cli: Cli, groups: Vec<GroupConfig>) {
+        let layout = SeriesLayout::new(&cli, &groups);
+        let reload = groups != self.groups
+            || cli.max_points != self.cli.max_points
+            || cli.absolute_x != self.cli.absolute_x;
+        if reload {
+            let (data, watchers) = load_files(ctx, &cli, &groups, &layout.names);
+            self.data = data;
+            self.watchers = watchers;
+            self.toolbar.need_home = true;
+        }
+        // Hidden series (legend clicks) stay hidden while the series are the same
+        if layout.names != self.series_names {
+            self.series_visible = vec![true; layout.names.iter().map(Vec::len).sum()];
+        }
+        // Per-stack state has one entry per sub-plot (indexing past it panics)
+        if layout.stacks != self.stacks {
+            let n = layout.stacks.len();
+            self.pending_x = vec![None; n];
+            self.pending_y = vec![None; n];
+            self.current_bounds = vec![None; n];
+            self.y_axis_width = Y_AXIS_MIN_WIDTH;
+            self.toolbar.need_home = true;
+        }
+        self.stacks = layout.stacks;
+        self.stack_units = layout.stack_units;
+        self.series_names = layout.names;
+        self.series_stacks = layout.series_stacks;
+        self.series_units = layout.series_units;
+
+        self.repaint_interval_ms = cli.repaint_interval_ms;
+        self.x_axis_label = x_axis_label(&cli);
+        self.x_unit = cli.x_unit.clone();
+        self.line_width = cli.line_width;
+        self.colors = resolve_colors(&cli.colors);
+        self.max_points = cli.max_points;
+        self.max_x_range = cli.max_x_range;
+        self.marker_radius = cli.marker_radius;
+        self.x_proportion = groups[0].x_proportion;
+        // The toolbar notices the change and fits the view (as a click would)
+        self.toolbar.log_scale = cli.log_y;
+
+        let title = crate::window_title(&groups);
+        if title != crate::window_title(&self.groups) {
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Title(title));
+        }
+        if cli.bounds != self.cli.bounds || cli.monitor != self.cli.monitor {
+            self.place_window(&cli);
+        }
+        self.cli = cli;
+        self.groups = groups;
+    }
+
+    /// Move the main window to `--bounds` on `--monitor`, or without bounds
+    /// to the center of `--monitor` keeping its size.
+    fn place_window(&self, cli: &Cli) {
+        let Some(hwnd) = self.root_hwnd else { return };
+        #[cfg(windows)]
+        {
+            crate::restore_if_maximized(hwnd);
+            if let Some([x, y, w, h]) = crate::physical_placement(cli) {
+                crate::apply_window_placement(hwnd, x, y, w, h);
+            } else if let Some(work) = cli.monitor.and_then(crate::work_area_of_monitor) {
+                crate::center_window(hwnd, work);
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = (hwnd, cli);
+    }
+
+    /// The settings in effect as the settings window shows them: the log
+    /// scale as toggled in the toolbar.
+    fn current_settings(&self) -> Cli {
+        let mut cli = self.cli.clone();
+        cli.log_y = self.toolbar.log_scale;
+        cli
     }
 }
 
@@ -446,10 +608,20 @@ impl eframe::App for PlotApp {
                 )
             });
         }
+        // The hook also runs for the settings window, where a wheel scrolls
+        if raw_input.viewport_id != egui::ViewportId::ROOT {
+            return;
+        }
         for event in &mut raw_input.events {
             if let Event::MouseWheel { modifiers, .. } = event {
                 modifiers.ctrl = true;
             }
+        }
+    }
+
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some((cli, groups)) = self.settings.logic(ctx) {
+            self.apply_config(ctx, cli, groups);
         }
     }
 
@@ -480,6 +652,12 @@ impl eframe::App for PlotApp {
         egui::Panel::top("toolbar").show_inside(ui, |ui| {
             self.toolbar.ui(ui);
         });
+        let oneshot_tab = self.oneshot_settings_tab.take();
+        if std::mem::take(&mut self.toolbar.open_settings) || oneshot_tab.is_some() {
+            let cli = self.current_settings();
+            let groups = self.groups.clone();
+            self.settings.open(ui.ctx(), self.root_hwnd, cli, groups, oneshot_tab.as_deref());
+        }
 
         if self.toolbar.show_about {
             crate::render_about_modal(ui.ctx(), &mut self.toolbar.show_about);
@@ -996,11 +1174,11 @@ impl PlotApp {
     fn oneshot_tick(&mut self, ctx: &egui::Context, all_resolved: bool) {
         let loaded = self.watchers.iter().all(CsvWatcher::initial_load_done);
         let Some(os) = self.oneshot.as_mut() else { return };
-        if os.done {
+        if os.finished() {
             return;
         }
         if os.requested {
-            // The capture arrives a few frames later; keep frames coming.
+            // The captures arrive a few frames later; keep frames coming.
             ctx.request_repaint();
             return;
         }
@@ -1009,47 +1187,54 @@ impl PlotApp {
             && all_resolved
             && os.frames >= ONESHOT_MIN_FRAMES
             && !ctx.has_pending_images()
-            && !ctx.requested_repaint_last_pass();
+            && !ctx.requested_repaint_last_pass()
+            && (os.settings_path.is_none() || self.settings.ready_for_screenshot());
         os.stable = if settled { os.stable + 1 } else { 0 };
         let ready = os.stable >= ONESHOT_STABLE_FRAMES;
         if ready || os.started.elapsed() >= ONESHOT_TIMEOUT {
             os.timed_out = !ready;
             os.requested = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+            if os.settings_path.is_some() {
+                self.settings.request_screenshot(ctx);
+            }
             ctx.request_repaint();
         } else {
             ctx.request_repaint_after(ONESHOT_FRAME_DELAY);
         }
     }
 
-    /// One-shot: write a delivered screenshot, report it, close the app.
+    /// One-shot: write the delivered screenshots, report them, and close
+    /// the app once every requested one is handled.
     fn oneshot_receive(&mut self, ctx: &egui::Context) {
         let Some(os) = self.oneshot.as_mut() else { return };
-        if os.done || !os.requested {
+        if os.finished() || !os.requested {
             return;
         }
-        let image = ctx.input(|i| {
-            i.raw.events.iter().find_map(|e| match e {
-                egui::Event::Screenshot { image, .. } => Some(image.clone()),
-                _ => None,
-            })
-        });
-        let Some(image) = image else { return };
-        os.done = true;
-        let code = match save_png(&os.path, &image) {
-            Ok(()) => {
-                let shown = std::path::absolute(&os.path).unwrap_or_else(|_| os.path.clone());
-                println!("SCREENSHOT: {}", shown.display());
-                if os.timed_out {
-                    crate::ONESHOT_EXIT_TIMEOUT
-                } else {
-                    0
+        // eframe hands every pending capture to whichever window runs next:
+        // collect both windows' and sort them out by viewport id.
+        let mut captures = ctx.input(|i| crate::settings::screenshot_events(&i.raw.events));
+        captures.extend(self.settings.take_captures());
+        for (viewport, image) in captures {
+            if viewport == egui::ViewportId::ROOT && !os.saved {
+                os.saved = true;
+                os.failed |= !write_capture(&os.path, &image);
+            } else if viewport == crate::settings::viewport_id() && !os.settings_saved {
+                if let Some(path) = &os.settings_path {
+                    os.settings_saved = true;
+                    os.failed |= !write_capture(path, &image);
                 }
             }
-            Err(e) => {
-                println!("EXCEPTION: oneshot: cannot write {}: {}", os.path.display(), e);
-                1
-            }
+        }
+        if !os.finished() {
+            return;
+        }
+        let code = if os.failed {
+            1
+        } else if os.timed_out {
+            crate::ONESHOT_EXIT_TIMEOUT
+        } else {
+            0
         };
         crate::ONESHOT_EXIT.store(code, std::sync::atomic::Ordering::SeqCst);
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);

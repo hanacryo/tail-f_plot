@@ -323,7 +323,17 @@ impl CsvWatcher {
         if line.iter().all(u8::is_ascii_whitespace) {
             return None;
         }
+        self.with_cells(line, |cell| self.parse_cells(cell))
+    }
 
+    /// Split a line (newline removed) into cells and hand `f` a lookup of
+    /// cell `col` (0-based: trimmed, quotes stripped; None past the last).
+    /// Data rows and the header row are split by this one rule.
+    fn with_cells<R>(
+        &self,
+        line: &[u8],
+        f: impl for<'c> FnOnce(&'c dyn Fn(usize) -> Option<&'c str>) -> R,
+    ) -> R {
         let text;
         let fields: Vec<Cow<'_, str>> = if !self.fixed_widths.is_empty() {
             // Fixed-width mode: columns are byte positions in the raw line,
@@ -355,7 +365,10 @@ impl CsvWatcher {
                 None => s,
             })
         };
+        f(&cell)
+    }
 
+    fn parse_cells<'c>(&self, cell: &'c dyn Fn(usize) -> Option<&'c str>) -> Option<Row> {
         let x: f64 = cell(self.x_col)?.parse().ok()?;
         // "nan"/"inf" parse fine but cannot be plotted, and a non-finite x
         // would poison the sorted-x tracking and every range scan built on it.
@@ -382,6 +395,34 @@ impl CsvWatcher {
 
         Some((x, epoch, ys))
     }
+}
+
+/// Cells of the header row (`--header-row`, 1-based; 0 = none) of a file,
+/// split like its data rows. Reads lines up to the header row (at most
+/// `LINE_CAP` bytes) and closes the file again; a file with fewer lines has
+/// no header yet.
+pub fn read_header(cfg: &GroupConfig) -> io::Result<Vec<String>> {
+    if cfg.header_row == 0 {
+        return Ok(Vec::new());
+    }
+    let file = File::open(&cfg.csv_path)?;
+    let mut reader = BufReader::new(file.take(LINE_CAP as u64));
+    let mut line = Vec::new();
+    for _ in 0..cfg.header_row {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Ok(Vec::new());
+        }
+    }
+    let mut line = trim_newline(&line);
+    if cfg.header_row == 1 {
+        line = line.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(line);
+    }
+    let policy = LoadPolicy { keep_rows: 1, need_origin: false, need_anchor: false };
+    let splitter = CsvWatcher::new(cfg, policy);
+    Ok(splitter.with_cells(line, |cell| {
+        (0..).map_while(|col| cell(col).map(String::from)).collect()
+    }))
 }
 
 /// Strip one trailing "\n" or "\r\n".
@@ -562,6 +603,38 @@ mod tests {
             epochtime_col: 0,
             epochtime_proportion: None,
         }
+    }
+
+    #[test]
+    fn header_is_split_like_data_rows() {
+        let t = TempFile::new("header_split.csv", b"\xEF\xBB\xBFtime,\"temp K\", P \r\n1,2,3\r\n");
+        let mut c = cfg(&t.0);
+        c.string_quote = Some('"');
+        assert_eq!(read_header(&c).unwrap(), ["time", "temp K", "P"]);
+
+        // Header on row 2 (no BOM handling there), merged delimiters
+        t.write(b"# comment\nA  B   C\n1 2 3\n");
+        c.header_row = 2;
+        c.delimiter = " ".into();
+        c.merge_delimiter = true;
+        assert_eq!(read_header(&c).unwrap(), ["A", "B", "C"]);
+
+        // Fixed widths cut the raw line
+        t.write(b"   x  y1  y2\n");
+        c.header_row = 1;
+        c.fixed_width = vec![4, 4, 4];
+        assert_eq!(read_header(&c).unwrap(), ["x", "y1", "y2"]);
+
+        // Fewer lines than the header row, or no header row at all
+        c.header_row = 5;
+        assert!(read_header(&c).unwrap().is_empty());
+        c.header_row = 0;
+        assert!(read_header(&c).unwrap().is_empty());
+
+        // A missing file is an error
+        c.header_row = 1;
+        c.csv_path = t.0.with_file_name("missing.csv");
+        assert!(read_header(&c).is_err());
     }
 
     fn setup(c: &GroupConfig, keep: usize) -> (CsvWatcher, PlotData) {

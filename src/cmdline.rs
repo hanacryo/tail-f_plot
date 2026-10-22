@@ -50,7 +50,6 @@ pub fn parse_args(args: Vec<String>) -> Result<ParsedArgs, clap::Error> {
 /// group before it. Valued options are written as `--name=value`, so a
 /// value starting with `-` stays a value. `--help` and `--oneshot` are never
 /// written. Err = a setting the command line cannot express.
-#[allow(dead_code)] // TODO: drop once the settings window calls it
 pub fn to_argv(cli: &Cli, groups: &[GroupConfig]) -> Result<Vec<String>, String> {
     let defaults = Cli::try_parse_from(["tail-f_plot", "x"]).expect("defaults parse");
     let Some((first, rest)) = groups.split_first() else {
@@ -272,7 +271,6 @@ const QUOTE_TRIGGERS: &[char] = &[' ', '\t', '"', '&', '|', '<', '>', '^', '(', 
 /// One argument quoted for a Windows command line so the MSVC /
 /// `CommandLineToArgvW` rules read it back unchanged: inside quotes a `"` is
 /// written `\"`, and backslashes are doubled only right before a quote.
-#[allow(dead_code)] // TODO: drop once the settings window calls it
 pub fn quote_arg(arg: &str) -> String {
     if !arg.is_empty() && !arg.contains(QUOTE_TRIGGERS) {
         return arg.to_string();
@@ -302,7 +300,6 @@ pub fn quote_arg(arg: &str) -> String {
 /// `program` and `args` as one line for cmd.exe or a `.cmd` file. The
 /// program is only wrapped in quotes: Windows reads the first argument up to
 /// the closing quote, without backslash escapes.
-#[allow(dead_code)] // TODO: drop once the settings window calls it
 pub fn command_line(program: &str, args: &[String]) -> String {
     let mut line = if program.contains(QUOTE_TRIGGERS) {
         format!("\"{program}\"")

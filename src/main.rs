@@ -4,6 +4,7 @@
 // #![windows_subsystem = "console"]  ← implicit default; kept as a comment for clarity.
 
 mod app;
+mod cmdline;
 mod csv_watcher;
 mod custom_legend;
 mod groups;
@@ -226,7 +227,7 @@ fn load_icon() -> egui::IconData {
         .expect("Failed to load icon")
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "tail-f_plot", version = env!("FULL_VERSION"), disable_help_flag = true)]
 pub struct Cli {
     /// Print help
@@ -244,7 +245,7 @@ pub struct Cli {
     #[arg(long, value_delimiter = ',')]
     y_cols: Vec<usize>,
 
-    /// Y-axis legend names (comma separated)
+    /// Y-axis legend names (comma separated; `""` = default names)
     #[arg(long, value_delimiter = ',')]
     y_names: Vec<String>,
 
@@ -309,7 +310,7 @@ pub struct Cli {
     epochtime_col: usize,
 
     /// Proportional constant applied to the epoch-time column
-    /// (default: this file's resolved --x-proportion)
+    /// (default or 0: this file's resolved --x-proportion)
     #[arg(long)]
     epochtime_proportion: Option<f64>,
 
@@ -399,7 +400,7 @@ fn help_text() -> String {
         Options:\n\
         --x-col <N>              X-axis column (1-based) [default: 1]\n\
         --y-cols <N,N,...>       Y-axis columns (comma separated)\n\
-        --y-names <A,B,...>      Y-axis legend names (comma separated)\n\
+        --y-names <A,B,...>      Y-axis legend names (comma separated; \"\"=reset)\n\
         --y-stacks <N,N,...>     Stack index per Y column (1-based): series\n\
         \x20                        with different indices stack vertically\n\
         --header-row <N>         Header row number [default: 2]\n\
@@ -416,7 +417,7 @@ fn help_text() -> String {
         --merge-delimiter        Merge consecutive delimiters (=false to reset)\n\
         --fixed-width <N,N,...>  Fixed-width columns (overrides delimiter; 0=reset)\n\
         --epochtime-col <N>      Epoch-time column for multi-file alignment (0=off)\n\
-        --epochtime-proportion <F>  Epoch scale [default: --x-proportion]\n\n\
+        --epochtime-proportion <F>  Epoch scale [default: --x-proportion; 0=reset]\n\n\
         Rendering:\n\
         --repaint-interval-ms <N>  Repaint interval [default: 250]\n\
         --x-axis-label <STR>       X-axis label [default: Time]\n\
@@ -549,43 +550,21 @@ fn main() -> eframe::Result {
         SetProcessDpiAwarenessContext(-4isize as _);
     }
 
-    // Split argv on literal `--` tokens: the first segment is the normal CLI
-    // (globals + first file), each later segment describes one more file and
-    // inherits omitted options from the previous group.
-    let segments = groups::split_arg_groups(std::env::args().collect());
-
-    // Parse CLI — all error/help paths show the same help_text()
-    let cli = match Cli::try_parse_from(&segments[0]) {
-        Ok(cli) => {
-            if cli.help || cli.csv_path.is_none() {
-                let help = help_text();
-                if owns_console {
-                    show_help_window(help);
-                } else {
-                    println!("{}", help);
-                }
-                std::process::exit(if cli.help { 0 } else { 1 });
+    // Parse CLI (globals + one config per `--`-separated file group) — all
+    // error/help paths show the same help_text()
+    let (cli, group_cfgs) = match cmdline::parse_args(std::env::args().collect()) {
+        Ok(cmdline::ParsedArgs::Run { cli, groups }) => (cli, groups),
+        Ok(cmdline::ParsedArgs::Help { requested }) => {
+            let help = help_text();
+            if owns_console {
+                show_help_window(help);
+            } else {
+                println!("{}", help);
             }
-            cli
+            std::process::exit(if requested { 0 } else { 1 });
         }
         Err(e) => exit_with_parse_error(e, owns_console),
     };
-
-    let mut group_cfgs = vec![groups::GroupConfig::from_cli(&cli)];
-    for seg in &segments[1..] {
-        // A fully empty group would only duplicate the previous one — skip it
-        // (tolerates a trailing `--`).
-        if seg.is_empty() {
-            continue;
-        }
-        match groups::GroupCli::try_parse_from(seg) {
-            Ok(g) => {
-                let next = group_cfgs.last().unwrap().apply(&g);
-                group_cfgs.push(next);
-            }
-            Err(e) => exit_with_parse_error(e, owns_console),
-        }
-    }
 
     println!("PID: {}", std::process::id());
     for cfg in &group_cfgs {

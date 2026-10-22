@@ -133,7 +133,7 @@ With `--oneshot <PNG_PATH>` the window renders once, saves a screenshot and exit
 |--------|---------|-------------|
 | `--x-col <N>` | `1` | X-axis column (1-based) |
 | `--y-cols <N,N,...>` | | Y-axis columns (1-based, comma-separated) |
-| `--y-names <A,B,...>` | | Legend names (comma-separated) |
+| `--y-names <A,B,...>` | | Legend names (comma-separated; `""` = default names) |
 | `--y-stacks <N,N,...>` | all `1` | Stack index per Y column (1-based); see below |
 | `--header-row <N>` | `2` | Header row number (1-based) |
 | `--data-start-row <N>` | `3` | Data start row (1-based) |
@@ -153,7 +153,7 @@ With `--oneshot <PNG_PATH>` the window renders once, saves a screenshot and exit
 | `--merge-delimiter` | `false` | Treat consecutive delimiters as one (`--merge-delimiter=false` to disable) |
 | `--fixed-width <N,N,...>` | | Fixed-width column widths (overrides delimiter) |
 | `--epochtime-col <N>` | `0` (off) | Epoch-time column (1-based) for multi-file alignment |
-| `--epochtime-proportion <F>` | `--x-proportion` | Multiplier applied to the epoch-time column |
+| `--epochtime-proportion <F>` | `--x-proportion` | Multiplier applied to the epoch-time column (`0` = follow `--x-proportion`) |
 
 ### Rendering Options
 
@@ -185,7 +185,7 @@ tail-f_plot.exe a.csv --y-cols 2,3 -- b.csv --y-cols 2 -- c.csv
 
 **Per-group options**: `<CSV_PATH>`, `--x-col`, `--y-cols`, `--y-names`, `--y-stacks`, `--header-row`, `--data-start-row`, `--delimiter`, `--string-quote`, `--merge-delimiter`, `--fixed-width`, `--x-time-scale`, `--x-proportion`, `--epochtime-col`, `--epochtime-proportion`. All other options are window-global and belong to the first group only — using one after `--` is an error.
 
-**Resetting an inherited option**: `--epochtime-col 0` (disable), `--fixed-width 0` (back to delimiter mode), `--merge-delimiter=false`.
+**Resetting an inherited option**: `--epochtime-col 0` (disable), `--fixed-width 0` (back to delimiter mode), `--merge-delimiter=false`, `--y-names ""` (back to default names), `--epochtime-proportion 0` (back to following the group's `--x-proportion`).
 
 **X units per file** — each group's `--x-time-scale` / `--x-proportion` scales that file's raw X into the shared display unit. E.g. first file logs seconds, second logs milliseconds:
 

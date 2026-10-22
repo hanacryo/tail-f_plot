@@ -36,6 +36,31 @@ pub fn resolve_x_proportion(time_scale: Option<&str>, fallback: f64) -> f64 {
     }
 }
 
+/// `--y-names ""` (a single empty name) resets to the default names, which
+/// later groups could not get back otherwise once a group set names.
+pub fn names_or_default(names: &[String]) -> Vec<String> {
+    if names.len() == 1 && names[0].is_empty() {
+        Vec::new()
+    } else {
+        names.to_vec()
+    }
+}
+
+/// `--epochtime-proportion 0` resets to following the group's own
+/// `--x-proportion` (None), like `--epochtime-col 0` disables the column.
+pub fn epoch_proportion_arg(p: f64) -> Option<f64> {
+    (p != 0.0).then_some(p)
+}
+
+/// `--fixed-width 0` is delimiter mode (no fixed widths).
+pub fn fixed_widths(widths: &[usize]) -> Vec<usize> {
+    if widths == [0] {
+        Vec::new()
+    } else {
+        widths.to_vec()
+    }
+}
+
 /// Per-group arguments after a `--` separator. `None` = inherit from the
 /// previous group. Global options (window, colors, axes labels, ...) are not
 /// accepted here — clap reports them as unexpected arguments.
@@ -53,7 +78,7 @@ pub struct GroupCli {
     #[arg(long, value_delimiter = ',')]
     y_cols: Option<Vec<usize>>,
 
-    /// Y-axis legend names (comma separated)
+    /// Y-axis legend names (comma separated; `""` = back to default names)
     #[arg(long, value_delimiter = ',')]
     y_names: Option<Vec<String>>,
 
@@ -97,13 +122,14 @@ pub struct GroupCli {
     #[arg(long)]
     epochtime_col: Option<usize>,
 
-    /// Proportional constant for the epoch-time column
+    /// Proportional constant for the epoch-time column (0 = back to
+    /// following this group's x proportion)
     #[arg(long)]
     epochtime_proportion: Option<f64>,
 }
 
 /// Fully resolved per-file settings (inheritance already applied).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GroupConfig {
     pub csv_path: PathBuf,
     pub x_col: usize,
@@ -133,17 +159,17 @@ impl GroupConfig {
             csv_path: cli.csv_path.clone().expect("csv_path checked in main"),
             x_col: cli.x_col,
             y_cols: cli.y_cols.clone(),
-            y_names: cli.y_names.clone(),
+            y_names: names_or_default(&cli.y_names),
             y_stacks: cli.y_stacks.clone(),
             header_row: cli.header_row,
             data_start_row: cli.data_start_row,
             delimiter: resolve_delimiter(&cli.delimiter),
             string_quote: resolve_string_quote(&cli.string_quote),
             merge_delimiter: cli.merge_delimiter.unwrap_or(false),
-            fixed_width: cli.fixed_width.clone(),
+            fixed_width: fixed_widths(&cli.fixed_width),
             x_proportion: resolve_x_proportion(cli.x_time_scale.as_deref(), cli.x_proportion),
             epochtime_col: cli.epochtime_col,
-            epochtime_proportion: cli.epochtime_proportion,
+            epochtime_proportion: cli.epochtime_proportion.and_then(epoch_proportion_arg),
         }
     }
 
@@ -164,7 +190,10 @@ impl GroupConfig {
             csv_path: g.csv_path.clone().unwrap_or_else(|| self.csv_path.clone()),
             x_col: g.x_col.unwrap_or(self.x_col),
             y_cols: g.y_cols.clone().unwrap_or_else(|| self.y_cols.clone()),
-            y_names: g.y_names.clone().unwrap_or_else(|| self.y_names.clone()),
+            y_names: match &g.y_names {
+                Some(names) => names_or_default(names),
+                None => self.y_names.clone(),
+            },
             y_stacks: g.y_stacks.clone().unwrap_or_else(|| self.y_stacks.clone()),
             header_row: g.header_row.unwrap_or(self.header_row),
             data_start_row: g.data_start_row.unwrap_or(self.data_start_row),
@@ -180,13 +209,15 @@ impl GroupConfig {
                 .unwrap_or(self.string_quote),
             merge_delimiter: g.merge_delimiter.unwrap_or(self.merge_delimiter),
             fixed_width: match &g.fixed_width {
-                Some(w) if w.as_slice() == [0] => Vec::new(),
-                Some(w) => w.clone(),
+                Some(w) => fixed_widths(w),
                 None => self.fixed_width.clone(),
             },
             x_proportion,
             epochtime_col: g.epochtime_col.unwrap_or(self.epochtime_col),
-            epochtime_proportion: g.epochtime_proportion.or(self.epochtime_proportion),
+            epochtime_proportion: match g.epochtime_proportion {
+                Some(p) => epoch_proportion_arg(p),
+                None => self.epochtime_proportion,
+            },
         }
     }
 
@@ -335,6 +366,30 @@ mod tests {
         let g = GroupCli::try_parse_from(strs(&["--epochtime-proportion", "1.0"])).unwrap();
         let next = cfg.apply(&g);
         assert_eq!(next.epoch_proportion(), 1.0);
+    }
+
+    #[test]
+    fn epoch_proportion_zero_resets_to_following_x_proportion() {
+        let mut base = base_config();
+        base.epochtime_proportion = Some(2.0);
+        let g = GroupCli::try_parse_from(strs(&["--x-time-scale", "s", "--epochtime-proportion", "0"]))
+            .unwrap();
+        let next = base.apply(&g);
+        assert_eq!(next.epochtime_proportion, None);
+        assert_eq!(next.epoch_proportion(), 1.0);
+    }
+
+    #[test]
+    fn empty_y_names_resets_to_default_names() {
+        let g = GroupCli::try_parse_from(strs(&["--y-names", ""])).unwrap();
+        assert!(base_config().apply(&g).y_names.is_empty());
+
+        let g = GroupCli::try_parse_from(strs(&["--y-names="])).unwrap();
+        assert!(base_config().apply(&g).y_names.is_empty());
+
+        // Two empty names are names, not a reset
+        let g = GroupCli::try_parse_from(strs(&["--y-names=,"])).unwrap();
+        assert_eq!(base_config().apply(&g).y_names, strs(&["", ""]));
     }
 
     #[test]

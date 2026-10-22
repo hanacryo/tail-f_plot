@@ -309,10 +309,11 @@ pub fn quote_arg(arg: &str) -> String {
     out
 }
 
-/// `program` and `args` as one line for cmd.exe. The program is always
-/// wrapped in quotes, without escapes (Windows reads the first argument up
-/// to the closing quote): cmd also ends an unquoted command at `,` `;` `=`,
-/// which a path may hold, and a path never holds `"`.
+/// `program` and `args` as one line for interactive cmd.exe (for a `.cmd`
+/// file see `for_batch_file`). The program is always wrapped in quotes,
+/// without escapes (Windows reads the first argument up to the closing
+/// quote): cmd also ends an unquoted command at `,` `;` `=`, which a path
+/// may hold, and a path never holds `"`.
 pub fn command_line(program: &str, args: &[String]) -> String {
     let mut line = format!("\"{program}\"");
     for arg in args {
@@ -320,6 +321,12 @@ pub fn command_line(program: &str, args: &[String]) -> String {
         line.push_str(&quote_arg(arg));
     }
     line
+}
+
+/// A `command_line` for a `.cmd` file: a batch file expands `%` even inside
+/// quotes, so every `%` is doubled (interactive cmd would keep `%%` as is).
+pub fn for_batch_file(line: &str) -> String {
+    line.replace('%', "%%")
 }
 
 #[cfg(test)]
@@ -563,5 +570,6 @@ mod tests {
         );
         // cmd would end an unquoted command at , ; =
         assert_eq!(command_line(r"D:\plot,v2\tail-f_plot.exe", &[]), r#""D:\plot,v2\tail-f_plot.exe""#);
+        assert_eq!(for_batch_file(r#""x.exe" --y-unit=% "--y-names=a%b""#), r#""x.exe" --y-unit=%% "--y-names=a%%b""#);
     }
 }

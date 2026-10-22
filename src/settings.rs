@@ -42,6 +42,8 @@ const SHEET_HEIGHT: f32 = 130.0;
 /// A header read that has not answered after this long (e.g. a network path
 /// that hangs) no longer holds back the next one
 const HEADER_READ_PATIENCE: f64 = 2.0;
+/// Seconds after which a header row shown is read again
+const HEADER_REFRESH: f64 = 2.0;
 
 /// `--delimiter` / `--string-quote` / `--x-time-scale` names and labels
 const DELIMITERS: [(&str, &str); 5] = [
@@ -134,7 +136,9 @@ mod help {
     pub const ADD_COLUMN: &str = "Add a Y column (the next column number, same stack)";
     pub const REMOVE_COLUMN: &str = "Remove this Y column";
 
-    pub const COPY: &str = "Copy the command line to the clipboard";
+    pub const COPY: &str = "Copy the command line to the clipboard, for the cmd prompt";
+    pub const COPY_BATCH: &str =
+        "Copy the command line with every % doubled, for a .cmd (batch) file";
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -198,6 +202,10 @@ struct Draft {
     x_unit: String,
     y_unit: String,
     y_units: String,
+    /// The list `y_units` was made from: `--y-units=` (one empty unit) joins
+    /// to "" like no units at all, but gives stack 1 no unit instead of
+    /// Y unit. Kept while the field still reads as it was made.
+    y_units_given: Vec<String>,
     line_width: String,
     marker_radius: String,
     colors: String,
@@ -257,6 +265,7 @@ impl Draft {
             x_unit: cli.x_unit.clone(),
             y_unit: cli.y_unit.clone(),
             y_units: cli.y_units.join(","),
+            y_units_given: cli.y_units.clone(),
             line_width: cli.line_width.to_string(),
             marker_radius: cli.marker_radius.to_string(),
             colors: cli.colors.join(","),
@@ -281,7 +290,11 @@ impl Draft {
         cli.x_axis_label = self.x_axis_label.clone();
         cli.x_unit = self.x_unit.clone();
         cli.y_unit = self.y_unit.clone();
-        cli.y_units = list(&self.y_units);
+        cli.y_units = if self.y_units == self.y_units_given.join(",") {
+            self.y_units_given.clone()
+        } else {
+            list(&self.y_units)
+        };
         let width = number(p, "line_width", &self.line_width, "Line width", |v: f32| {
             v.is_finite() && v > 0.0
         });
@@ -598,9 +611,17 @@ struct HeaderKey {
     fixed_width: Vec<usize>,
 }
 
-enum Header {
-    Reading(mpsc::Receiver<Result<Vec<String>, String>>),
-    Read(Result<Vec<String>, String>),
+/// The header row of one `HeaderKey`: the last result, refreshed every
+/// `HEADER_REFRESH` seconds (the file may appear, get its header, or be
+/// replaced by one with other columns while the window is open).
+#[derive(Default)]
+struct Header {
+    /// None until the first read finished
+    result: Option<Result<Vec<String>, String>>,
+    /// When `result` arrived
+    read_at: f64,
+    /// The read in flight; `result` stays shown meanwhile
+    reading: Option<mpsc::Receiver<Result<Vec<String>, String>>>,
 }
 
 /// Files tab state: selection, header rows read so far, an open file dialog.
@@ -616,17 +637,17 @@ struct Files {
 
 impl Files {
     /// Collect finished header reads and a finished file dialog.
-    fn poll(&mut self, groups: &mut [GroupDraft]) {
+    fn poll(&mut self, groups: &mut [GroupDraft], now: f64) {
         for header in self.headers.values_mut() {
-            if let Header::Reading(rx) = header {
-                match rx.try_recv() {
-                    Ok(result) => *header = Header::Read(result),
-                    Err(mpsc::TryRecvError::Empty) => {}
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        *header = Header::Read(Err("could not be read".into()));
-                    }
-                }
-            }
+            let Some(rx) = &header.reading else { continue };
+            let result = match rx.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty) => continue,
+                Err(mpsc::TryRecvError::Disconnected) => Err("could not be read".into()),
+            };
+            header.result = Some(result);
+            header.read_at = now;
+            header.reading = None;
         }
         if !self.reading() {
             self.reading_since = None;
@@ -646,21 +667,17 @@ impl Files {
     }
 
     fn reading(&self) -> bool {
-        self.headers.values().any(|h| matches!(h, Header::Reading(_)))
+        self.headers.values().any(|h| h.reading.is_some())
     }
 
-    /// The header row for `key`, starting a background read if it was not
-    /// read yet (one at a time, unless the one in flight hangs). None =
-    /// waiting for another read to finish first.
-    fn header(
-        &mut self,
-        key: HeaderKey,
-        cfg: GroupConfig,
-        ctx: &egui::Context,
-        now: f64,
-    ) -> Option<&Header> {
+    /// The header row for `key`, read in the background when not read yet
+    /// or older than `HEADER_REFRESH` (one read at a time, unless the one in
+    /// flight hangs).
+    fn header(&mut self, key: HeaderKey, cfg: GroupConfig, ctx: &egui::Context, now: f64) -> &Header {
         let may_start = self.reading_since.is_none_or(|t| now - t > HEADER_READ_PATIENCE);
-        if !self.headers.contains_key(&key) && may_start {
+        let header = self.headers.entry(key).or_default();
+        let due = header.result.is_none() || now - header.read_at >= HEADER_REFRESH;
+        if header.reading.is_none() && due && may_start {
             let (tx, rx) = mpsc::channel();
             let ctx = ctx.clone();
             let spawned = std::thread::Builder::new().name("header-read".into()).spawn(move || {
@@ -672,11 +689,11 @@ impl Files {
                 ctx.request_repaint_of(viewport_id());
             });
             if spawned.is_ok() {
-                self.headers.insert(key.clone(), Header::Reading(rx));
+                header.reading = Some(rx);
                 self.reading_since = Some(now);
             }
         }
-        self.headers.get(&key)
+        header
     }
 }
 
@@ -879,7 +896,12 @@ fn settings_ui(ui: &mut egui::Ui, _class: ViewportClass, shared: &Mutex<Shared>)
     let mut guard = lock(shared);
     let s = &mut *guard;
     let now = ui.input(|i| i.time);
-    let mut close = ui.input(|i| i.viewport().close_requested() || i.key_pressed(egui::Key::Escape));
+    // Esc closes the window like Cancel, except when it closes an open
+    // combo popup (egui closes the popup on the same, unconsumed key)
+    let popup_open = egui::Popup::is_any_open(ui.ctx());
+    let mut close = ui.input(|i| {
+        i.viewport().close_requested() || (i.key_pressed(egui::Key::Escape) && !popup_open)
+    });
 
     s.frames = s.frames.saturating_add(1);
     if s.oneshot {
@@ -892,7 +914,7 @@ fn settings_ui(ui: &mut egui::Ui, _class: ViewportClass, shared: &Mutex<Shared>)
             ui.ctx().request_repaint();
         }
     }
-    s.files.poll(&mut s.draft.groups);
+    s.files.poll(&mut s.draft.groups, now);
 
     let built = s.draft.build(&s.base);
     let changed = s.draft != s.applied;
@@ -955,18 +977,23 @@ fn settings_ui(ui: &mut egui::Ui, _class: ViewportClass, shared: &Mutex<Shared>)
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
     }
 
-    if (apply || ok) && changed {
-        if let Ok(b) = &built {
-            s.apply = Some((b.cli.clone(), b.groups.clone()));
-            s.applied = s.draft.clone();
-            ui.ctx().request_repaint_of(ViewportId::ROOT);
+    // Apply / OK act on the draft as it is now: the fields above may have
+    // changed it in this same pass (input that queued up while the UI thread
+    // was busy), after `built` was made.
+    let mut close_ok = false;
+    if apply || ok {
+        if let Ok(b) = s.draft.build(&s.base) {
+            if s.draft != s.applied {
+                s.apply = Some((b.cli, b.groups));
+                s.applied = s.draft.clone();
+                ui.ctx().request_repaint_of(ViewportId::ROOT);
+            }
+            close_ok = ok;
         }
     }
-    if (ok && built.is_ok()) || close {
-        if !s.close {
-            s.close = true;
-            ui.ctx().request_repaint_of(ViewportId::ROOT);
-        }
+    if (close_ok || close) && !s.close {
+        s.close = true;
+        ui.ctx().request_repaint_of(ViewportId::ROOT);
     }
 }
 
@@ -1164,22 +1191,25 @@ fn group_form(
     #[cfg(not(windows))]
     let _ = hwnd;
 
-    // The header row's names, for the column pickers
+    // The header row's names, for the column pickers. Read again every
+    // HEADER_REFRESH seconds while shown, also without input.
     let (names, header_note) = match g.header_request() {
         None => (Vec::new(), "No header row".to_string()),
-        Some((hkey, cfg)) => match files.header(hkey, cfg, ui.ctx(), now) {
-            None | Some(Header::Reading(_)) => {
-                (Vec::new(), "Reading the header row\u{2026}".to_string())
+        Some((hkey, cfg)) => {
+            let refresh = std::time::Duration::from_secs_f64(HEADER_REFRESH);
+            ui.ctx().request_repaint_after(refresh);
+            match &files.header(hkey, cfg, ui.ctx(), now).result {
+                None => (Vec::new(), "Reading the header row\u{2026}".to_string()),
+                Some(Ok(names)) if names.is_empty() => {
+                    (Vec::new(), "The header row is empty or not written yet".to_string())
+                }
+                Some(Ok(names)) => {
+                    let note = format!("Header row: {} columns", names.len());
+                    (names.clone(), note)
+                }
+                Some(Err(e)) => (Vec::new(), format!("Header row: {e}")),
             }
-            Some(Header::Read(Ok(names))) if names.is_empty() => {
-                (Vec::new(), "The header row is empty or not written yet".to_string())
-            }
-            Some(Header::Read(Ok(names))) => {
-                let note = format!("Header row: {} columns", names.len());
-                (names.clone(), note)
-            }
-            Some(Header::Read(Err(e))) => (Vec::new(), format!("Header row: {e}")),
-        },
+        }
     };
 
     ui.horizontal(|ui| {
@@ -1309,7 +1339,13 @@ fn group_form(
             let next = g.columns.last().map_or_else(
                 || ColumnDraft { col: "2".into(), name: String::new(), stack: "1".into() },
                 |last| ColumnDraft {
-                    col: last.col.trim().parse::<usize>().map_or(String::new(), |c| (c + 1).to_string()),
+                    col: last
+                        .col
+                        .trim()
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|c| c.checked_add(1))
+                        .map_or(String::new(), |c| c.to_string()),
                     name: String::new(),
                     stack: last.stack.clone(),
                 },
@@ -1438,15 +1474,27 @@ fn command_line_tab(ui: &mut egui::Ui, built: &Result<Built, Vec<Problem>>) -> b
         );
     });
     ui.add_space(6.0);
+    let mut copied = false;
     ui.horizontal(|ui| {
-        let copied = ui.button("Copy").on_hover_text(help::COPY).clicked();
-        if copied {
+        if ui.button("Copy").on_hover_text(help::COPY).clicked() {
             ui.ctx().copy_text(line.clone());
+            copied = true;
         }
-        ui.weak("For cmd.exe and .cmd files (in PowerShell, put & in front).");
-        copied
-    })
-    .inner
+        // A .cmd file expands % even inside quotes; the cmd prompt keeps %%
+        // as is, so one line cannot serve both
+        if line.contains('%') {
+            let button = ui.button("Copy for .cmd file").on_hover_text(help::COPY_BATCH);
+            if button.clicked() {
+                ui.ctx().copy_text(cmdline::for_batch_file(&line));
+                copied = true;
+            }
+        }
+    });
+    ui.weak("Copy: for the cmd prompt (in PowerShell, put & in front).");
+    if line.contains('%') {
+        ui.weak("This line has %: in a .cmd file each % must be doubled (Copy for .cmd file).");
+    }
+    copied
 }
 
 #[cfg(windows)]
@@ -1456,8 +1504,8 @@ mod win32 {
     use eframe::egui::{self, ViewportCommand, ViewportId};
     use windows_sys::Win32::Foundation::{HWND, LPARAM};
     use windows_sys::Win32::UI::Controls::Dialogs::{
-        GetOpenFileNameW, OFN_EXPLORER, OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST,
-        OPENFILENAMEW,
+        CommDlgExtendedError, GetOpenFileNameW, FNERR_INVALIDFILENAME, OFN_EXPLORER,
+        OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
     };
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -1648,7 +1696,13 @@ mod win32 {
             ofn.nMaxFile = buf.len() as u32;
             ofn.lpstrTitle = title.as_ptr();
             ofn.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
-            let picked = unsafe { GetOpenFileNameW(&mut ofn) } != 0;
+            let mut picked = unsafe { GetOpenFileNameW(&mut ofn) } != 0;
+            // An initial name the dialog rejects (a pasted "quoted" path,
+            // < > |) makes it fail without opening: open it empty instead
+            if !picked && unsafe { CommDlgExtendedError() } == FNERR_INVALIDFILENAME {
+                buf[0] = 0;
+                picked = unsafe { GetOpenFileNameW(&mut ofn) } != 0;
+            }
             let path = picked.then(|| {
                 let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
                 String::from_utf16_lossy(&buf[..n])
@@ -1683,6 +1737,70 @@ mod tests {
             Ok(_) => Vec::new(),
             Err(problems) => problems.into_iter().map(|(k, _)| k).collect(),
         }
+    }
+
+    /// Where a text is drawn (its galley's top-left), searching nested shapes.
+    fn text_pos(shapes: &[egui::epaint::ClippedShape], text: &str) -> Option<egui::Pos2> {
+        fn find(shape: &egui::Shape, text: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == text => Some(t.pos),
+                egui::Shape::Vec(v) => v.iter().find_map(|s| find(s, text)),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|c| find(&c.shape, text))
+    }
+
+    /// Esc while a combo list is open closes the list only; the next Esc
+    /// closes the window, so two presses close both and no more are needed.
+    /// Drives the real window UI with clicks and keys.
+    #[test]
+    fn esc_closes_an_open_list_first_then_the_window() {
+        let (cli, groups) = parse("a.csv --y-cols=2");
+        let shared = Mutex::new(Shared::new(cli, groups, Tab::Files, false));
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, WINDOW_SIZE.into());
+        let mut time = 0.0;
+        let mut frame = |events: Vec<egui::Event>| {
+            time += 0.5;
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| settings_ui(ui, ViewportClass::Deferred, &shared))
+        };
+        let key = |pressed| egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let click = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        let out = frame(Vec::new());
+        let combo = text_pos(&out.shapes, "comma ( , )").expect("delimiter combo") + egui::vec2(5.0, 5.0);
+        frame(vec![egui::Event::PointerMoved(combo)]);
+        frame(vec![click(combo, true)]);
+        frame(vec![click(combo, false)]);
+        let out = frame(Vec::new());
+        assert!(text_pos(&out.shapes, "tab").is_some(), "the list is open");
+
+        // Press and release in one frame (a busy UI thread batches them)
+        let mut presses = 0;
+        while !lock(&shared).close && presses < 5 {
+            presses += 1;
+            frame(vec![key(true), key(false)]);
+            frame(Vec::new());
+        }
+        assert_eq!(presses, 2, "one Esc for the list, one for the window");
     }
 
     /// Repaints (e.g. on every mouse move) must not change the layout: a
@@ -1746,6 +1864,19 @@ mod tests {
         // Opened as is: nothing to apply
         let shared = Shared::new(cli, groups, Tab::Files, false);
         assert!(shared.draft == shared.applied);
+    }
+
+    /// `--y-units=` is one empty unit (stack 1 without a unit), not no units
+    #[test]
+    fn a_single_empty_y_unit_survives_the_draft() {
+        let (cli, groups) = parse("a.csv --y-cols=2 --y-unit=K --y-units=");
+        assert_eq!(cli.y_units, [""]);
+        let mut d = Draft::new(&cli, &groups);
+        d.line_width = "2".into();
+        assert_eq!(d.build(&cli).unwrap().cli.y_units, [""]);
+        // Typed over, the field is read as typed
+        d.y_units = "mbar".into();
+        assert_eq!(d.build(&cli).unwrap().cli.y_units, ["mbar"]);
     }
 
     #[test]

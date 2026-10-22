@@ -468,22 +468,29 @@ pub const DEFAULT_COLORS: [[u8; 3]; 12] = [
     [152, 223, 138],  // light green
 ];
 
-/// Parse #RRGGBB strings to [u8;3]. Falls back to default 12 colors if empty.
+/// Parse #RRGGBB strings to [u8;3]. Falls back to the default 12 colors
+/// when none is usable.
 pub fn resolve_colors(input: &[String]) -> Vec<[u8; 3]> {
-    if input.is_empty() {
-        return DEFAULT_COLORS.to_vec();
+    let colors: Vec<[u8; 3]> = input.iter().filter_map(|s| parse_color(s)).collect();
+    // No usable color (none given, or none valid) = the default palette;
+    // an empty palette would divide by zero when picking series colors.
+    if colors.is_empty() {
+        DEFAULT_COLORS.to_vec()
+    } else {
+        colors
     }
-    input
-        .iter()
-        .filter_map(|s| {
-            let hex = s.trim_start_matches('#');
-            if hex.len() != 6 { return None; }
-            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-            Some([r, g, b])
-        })
-        .collect()
+}
+
+/// `#RRGGBB` (the `#` is optional) as RGB.
+pub fn parse_color(s: &str) -> Option<[u8; 3]> {
+    let hex = s.trim_start_matches('#');
+    if hex.len() != 6 || !hex.is_ascii() {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some([r, g, b])
 }
 
 /// Get monitor work area (excluding taskbar) + DPI scale factor for given index (0-based).
@@ -757,3 +764,22 @@ pub fn apply_window_placement(hwnd: isize, x: i32, y: i32, w: i32, h: i32) {
 
 #[cfg(not(windows))]
 pub fn apply_window_placement(_hwnd: isize, _x: i32, _y: i32, _w: i32, _h: i32) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn colors_fall_back_to_the_default_palette() {
+        let strs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(resolve_colors(&[]), DEFAULT_COLORS.to_vec());
+        // None usable: the default palette, never an empty one
+        assert_eq!(resolve_colors(&strs(&["red", "#12345"])), DEFAULT_COLORS.to_vec());
+        // Unusable entries are skipped
+        let mixed = strs(&["#ff0000", "red", "00FF00"]);
+        assert_eq!(resolve_colors(&mixed), vec![[255, 0, 0], [0, 255, 0]]);
+        // Six bytes that are not six characters must not panic
+        assert_eq!(parse_color("\u{20ac}\u{20ac}"), None);
+        assert_eq!(parse_color("#\u{20ac}\u{20ac}"), None);
+    }
+}

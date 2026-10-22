@@ -74,6 +74,9 @@ pub struct CsvWatcher {
     tail_fp: Vec<u8>,
     /// The file has been opened and read through to its end at least once.
     loaded: bool,
+    /// The last poll could not confirm that its rows and its fingerprints
+    /// come from one version of the file: read it again from scratch.
+    stale: bool,
     _watcher: Option<RecommendedWatcher>,
 }
 
@@ -100,6 +103,7 @@ impl CsvWatcher {
             head_fp: Vec::new(),
             tail_fp: Vec::new(),
             loaded: false,
+            stale: false,
             _watcher: None,
         }
     }
@@ -163,20 +167,34 @@ impl CsvWatcher {
         let len = file.metadata()?.len();
         let identity = file_identity(file);
 
-        let replaced = self.loaded && {
-            let tail_off = self.pos - self.tail_fp.len() as u64;
-            identity != self.identity
+        // The tail fingerprint ends at `pos`; a state where it cannot is
+        // inconsistent and read again.
+        let tail_off = self.pos.checked_sub(self.tail_fp.len() as u64);
+        let replaced = self.loaded
+            && (self.stale
+                || identity != self.identity
                 || len < self.pos
+                || tail_off.is_none()
                 || read_at(file, 0, self.head_fp.len())? != self.head_fp
-                || read_at(file, tail_off, self.tail_fp.len())? != self.tail_fp
-        };
+                || read_at(file, tail_off.unwrap_or(0), self.tail_fp.len())? != self.tail_fp);
+        self.stale = false;
         if replaced {
             #[cfg(debug_assertions)]
             eprintln!("[CsvWatcher] file replaced or rewritten, reloading: {:?}", self.path);
             data.reset_group(group_idx);
             self.data_start = None;
             self.pos = 0;
+            // Consistent with pos 0 even if this poll fails further on: the
+            // next one then resumes the reload instead of comparing against
+            // the old file's fingerprints.
+            self.head_fp.clear();
+            self.tail_fp.clear();
         }
+        // Fingerprints just confirmed, to check after the load that the file
+        // did not change under it
+        let confirmed = (self.loaded && !replaced).then(|| {
+            (tail_off.unwrap_or(0), self.head_fp.clone(), self.tail_fp.clone())
+        });
         if !self.loaded || replaced {
             self.identity = identity;
             #[cfg(debug_assertions)]
@@ -196,9 +214,24 @@ impl CsvWatcher {
             None => false, // header still being written
         };
 
-        self.head_fp = read_at(file, 0, self.pos.min(HEAD_FP) as usize)?;
+        // The fingerprints are read after the rows. A writer that truncated
+        // or rewrote the file meanwhile shows up as a short read, or as the
+        // confirmed fingerprints no longer matching: then rows and
+        // fingerprints may come from different versions, and the next poll
+        // reads the file again instead of appending to mixed rows.
+        let head_len = self.pos.min(HEAD_FP);
         let tail_len = self.pos.min(TAIL_FP);
+        self.head_fp = read_at(file, 0, head_len as usize)?;
         self.tail_fp = read_at(file, self.pos - tail_len, tail_len as usize)?;
+        let complete =
+            self.head_fp.len() as u64 == head_len && self.tail_fp.len() as u64 == tail_len;
+        let unchanged = match &confirmed {
+            Some((off, head, tail)) => {
+                read_at(file, 0, head.len())? == *head && read_at(file, *off, tail.len())? == *tail
+            }
+            None => true,
+        };
+        self.stale = !(complete && unchanged);
         self.loaded = true;
         Ok(added)
     }
@@ -221,8 +254,16 @@ impl CsvWatcher {
             offset += n as u64;
         }
         drop(reader);
-        if offset == 0 && read_at(file, 0, 3)? == b"\xEF\xBB\xBF" {
-            offset = 3;
+        if offset == 0 {
+            const BOM: &[u8] = b"\xEF\xBB\xBF";
+            let head = read_at(file, 0, BOM.len().min(len as usize))?;
+            if head == BOM {
+                offset = 3;
+            } else if BOM.starts_with(&head) {
+                // Empty, or a BOM still being written: deciding now would
+                // keep a BOM written later in the first row's x cell.
+                return Ok(None);
+            }
         }
         Ok(Some(offset))
     }
@@ -339,9 +380,11 @@ impl CsvWatcher {
             // Fixed-width mode: columns are byte positions in the raw line,
             // so leading spaces (right-aligned columns) must stay.
             let mut result = Vec::with_capacity(self.fixed_widths.len());
-            let mut pos = 0;
+            let mut pos: usize = 0;
             for &width in &self.fixed_widths {
-                let end = (pos + width).min(line.len());
+                // Saturating: a huge width must end at the line, not wrap
+                // around to before `pos`
+                let end = pos.saturating_add(width).min(line.len());
                 result.push(String::from_utf8_lossy(&line[pos..end]));
                 pos = end;
             }
@@ -635,6 +678,61 @@ mod tests {
         c.header_row = 1;
         c.csv_path = t.0.with_file_name("missing.csv");
         assert!(read_header(&c).is_err());
+    }
+
+    #[test]
+    fn a_bom_written_after_an_empty_first_poll_is_still_skipped() {
+        let t = TempFile::new("bom_late.csv", b"");
+        let mut c = cfg(&t.0);
+        c.header_row = 0;
+        c.data_start_row = 1;
+        let (mut w, mut d) = setup(&c, 100);
+        assert!(!w.poll(&mut d, 0));
+        t.append(b"\xEF\xBB"); // BOM half written
+        assert!(!w.poll(&mut d, 0));
+        t.append(b"\xBF1.5,2\n2.5,3\n");
+        assert!(w.poll(&mut d, 0));
+        assert_eq!(xs(&d), [1.5, 2.5]);
+    }
+
+    /// A reload that failed half-way used to leave pos reset next to the old
+    /// file's fingerprints: the next poll underflowed (panic in debug, stuck
+    /// in release).
+    #[test]
+    fn inconsistent_fingerprints_reload_instead_of_underflowing() {
+        let t = TempFile::new("fp_state.csv", b"x,y\n1,1\n2,2\n");
+        let c = cfg(&t.0);
+        let (mut w, mut d) = setup(&c, 100);
+        assert!(w.poll(&mut d, 0));
+        w.pos = 0;
+        w.data_start = None;
+        assert!(!w.tail_fp.is_empty());
+        w.poll(&mut d, 0);
+        assert_eq!(xs(&d), [1.0, 2.0]);
+    }
+
+    #[test]
+    fn a_stale_poll_reads_the_file_again_without_duplicates() {
+        let t = TempFile::new("stale.csv", b"x,y\n1,1\n2,2\n");
+        let c = cfg(&t.0);
+        let (mut w, mut d) = setup(&c, 100);
+        w.poll(&mut d, 0);
+        w.stale = true;
+        w.poll(&mut d, 0);
+        assert_eq!(xs(&d), [1.0, 2.0]);
+        assert!(!w.stale);
+    }
+
+    #[test]
+    fn a_huge_fixed_width_ends_at_the_line() {
+        let t = TempFile::new("fw_huge.csv", b"1 2\n");
+        let mut c = cfg(&t.0);
+        c.header_row = 0;
+        c.data_start_row = 1;
+        c.fixed_width = vec![1, usize::MAX];
+        let (mut w, mut d) = setup(&c, 100);
+        w.poll(&mut d, 0);
+        assert_eq!(rows(&d), [(1.0, Some(2.0))]);
     }
 
     fn setup(c: &GroupConfig, keep: usize) -> (CsvWatcher, PlotData) {

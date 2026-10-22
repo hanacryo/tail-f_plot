@@ -378,10 +378,29 @@ fn load_files(
         data.add_group(names, cfg.epochtime_col > 0);
 
         let mut watcher = CsvWatcher::new(cfg, load_policy(groups, gi, cli));
-        watcher.start(ctx);
+        // One-shot paces its own passes and polls on each (oneshot_tick):
+        // change notifications would only add immediate repaints, which a
+        // file written faster than the pacing turns into a never-settling
+        // view.
+        if cli.oneshot.is_none() {
+            watcher.start(ctx);
+        }
         watchers.push(watcher);
     }
     (data, watchers)
+}
+
+/// Whether two sets of file groups read the same rows. Stacks only place
+/// series in sub-plots (handled through the series layout), and lists that
+/// place them the same way may be written differently.
+fn reads_same(a: &[GroupConfig], b: &[GroupConfig]) -> bool {
+    let without_stacks = |groups: &[GroupConfig]| -> Vec<GroupConfig> {
+        groups
+            .iter()
+            .map(|g| GroupConfig { y_stacks: Vec::new(), ..g.clone() })
+            .collect()
+    };
+    without_stacks(a) == without_stacks(b)
 }
 
 fn x_axis_label(cli: &Cli) -> String {
@@ -510,7 +529,7 @@ impl PlotApp {
     /// everything else applies in place.
     fn apply_config(&mut self, ctx: &egui::Context, cli: Cli, groups: Vec<GroupConfig>) {
         let layout = SeriesLayout::new(&cli, &groups);
-        let reload = groups != self.groups
+        let reload = !reads_same(&groups, &self.groups)
             || cli.max_points != self.cli.max_points
             || cli.absolute_x != self.cli.absolute_x;
         if reload {
@@ -565,12 +584,15 @@ impl PlotApp {
     /// to the center of `--monitor` keeping its size.
     fn place_window(&self, cli: &Cli) {
         let Some(hwnd) = self.root_hwnd else { return };
+        // Un-maximize only when something is placed: cleared bounds keep
+        // the window as it is
         #[cfg(windows)]
         {
-            crate::restore_if_maximized(hwnd);
             if let Some([x, y, w, h]) = crate::physical_placement(cli) {
+                crate::restore_if_maximized(hwnd);
                 crate::apply_window_placement(hwnd, x, y, w, h);
             } else if let Some(work) = cli.monitor.and_then(crate::work_area_of_monitor) {
+                crate::restore_if_maximized(hwnd);
                 crate::center_window(hwnd, work);
             }
         }
@@ -1243,11 +1265,28 @@ impl PlotApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{clip_param, dedupe_series_names, drawn_extent, stack_extent, Axis};
+    use super::{clip_param, dedupe_series_names, drawn_extent, reads_same, stack_extent, Axis};
     use crate::plot_state::PlotData;
 
     fn pts(v: &[(f64, Option<f64>)]) -> Vec<(f64, Option<f64>)> {
         v.to_vec()
+    }
+
+    /// A stack list written another way (the settings window writes one
+    /// per column) must not read every file again on Apply
+    #[test]
+    fn stacks_alone_do_not_change_what_is_read() {
+        let args = ["tail-f_plot", "a.csv", "--y-cols=2,3", "--y-stacks=1,1"];
+        let Ok(crate::cmdline::ParsedArgs::Run { groups, .. }) =
+            crate::cmdline::parse_args(args.iter().map(|s| s.to_string()).collect())
+        else {
+            panic!()
+        };
+        let mut other = groups.clone();
+        other[0].y_stacks = Vec::new();
+        assert!(reads_same(&groups, &other));
+        other[0].y_cols = vec![2];
+        assert!(!reads_same(&groups, &other));
     }
 
     fn fit(

@@ -815,6 +815,11 @@ fn main() -> eframe::Result {
         }),
     );
     if oneshot {
+        // A window that could not even start (no desktop, no GPU adapter)
+        // still reports on stdout, as the capture lines do
+        if let Err(e) = &result {
+            println!("EXCEPTION: oneshot: {e}");
+        }
         std::process::exit(ONESHOT_EXIT.load(std::sync::atomic::Ordering::SeqCst));
     }
     result
@@ -867,12 +872,25 @@ pub fn native_hwnd(handle: &impl raw_window_handle::HasWindowHandle) -> Option<i
     }
 }
 
-/// Place a window by its exact HWND (physical pixel coordinates).
+/// Place a window by its exact HWND (physical pixel coordinates). Landing
+/// on a monitor with another DPI makes winit rescale the window it was just
+/// given, so the rect is set again until it holds (twice at most).
 #[cfg(windows)]
 pub fn apply_window_placement(hwnd: isize, x: i32, y: i32, w: i32, h: i32) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
-    unsafe {
-        SetWindowPos(hwnd as _, std::ptr::null_mut(), x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER,
+    };
+    for _ in 0..2 {
+        unsafe {
+            SetWindowPos(hwnd as _, std::ptr::null_mut(), x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        let mut r: RECT = unsafe { std::mem::zeroed() };
+        let placed = unsafe { GetWindowRect(hwnd as _, &mut r) } != 0
+            && (r.left, r.top, r.right - r.left, r.bottom - r.top) == (x, y, w, h);
+        if placed {
+            break;
+        }
     }
 }
 

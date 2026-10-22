@@ -55,14 +55,19 @@ pub fn to_argv(cli: &Cli, groups: &[GroupConfig]) -> Result<Vec<String>, String>
     let Some((first, rest)) = groups.split_first() else {
         return Err("No file to plot".into());
     };
+    let base = GroupConfig::from_cli(&defaults);
+    // The stack list the parser holds for the previous group. An omitted
+    // --y-stacks inherits that raw list, which can be longer than what the
+    // previous group used (stacks are compared by effect, per series).
+    let mut stacks = base.y_stacks.clone();
     let mut args = vec![path_arg(&first.csv_path, 1)?];
-    group_diff(&GroupConfig::from_cli(&defaults), first, 1, &mut args)?;
+    group_diff(&base, first, &mut stacks, 1, &mut args)?;
     global_diff(&defaults, cli, &mut args)?;
     let mut prev = first;
     for (i, cur) in rest.iter().enumerate() {
         let n = i + 2;
         let mut options = Vec::new();
-        group_diff(prev, cur, n, &mut options)?;
+        group_diff(prev, cur, &mut stacks, n, &mut options)?;
         args.push("--".into());
         // The parser skips an empty segment: name the file even when it is
         // the same one, so an identical group is not dropped.
@@ -77,9 +82,12 @@ pub fn to_argv(cli: &Cli, groups: &[GroupConfig]) -> Result<Vec<String>, String>
 
 /// Append the per-file options of `cur` (file number `n`, for messages)
 /// that differ from `prev`: what an omitted option would inherit.
+/// `inherited_stacks` is the raw stack list the parser holds before `cur`;
+/// it is updated to what the parser holds after `cur`.
 fn group_diff(
     prev: &GroupConfig,
     cur: &GroupConfig,
+    inherited_stacks: &mut Vec<usize>,
     n: usize,
     args: &mut Vec<String>,
 ) -> Result<(), String> {
@@ -104,13 +112,15 @@ fn group_diff(
     } else {
         cur.y_names.len()
     };
-    let stacks = |g: &GroupConfig| -> Vec<usize> {
+    let stacks = |raw: &[usize]| -> Vec<usize> {
         (0..series)
-            .map(|i| g.y_stacks.get(i).copied().unwrap_or(1).max(1))
+            .map(|i| raw.get(i).copied().unwrap_or(1).max(1))
             .collect()
     };
-    if stacks(cur) != stacks(prev) {
-        args.push(format!("--y-stacks={}", join(&stacks(cur))));
+    let want = stacks(&cur.y_stacks);
+    if want != stacks(inherited_stacks) {
+        args.push(format!("--y-stacks={}", join(&want)));
+        *inherited_stacks = want;
     }
     if cur.header_row != prev.header_row {
         args.push(format!("--header-row={}", cur.header_row));
@@ -268,9 +278,11 @@ fn finite(v: f64, what: impl Fn() -> String) -> Result<f64, String> {
 /// the argv rules, the rest so cmd.exe does not act on them.
 const QUOTE_TRIGGERS: &[char] = &[' ', '\t', '"', '&', '|', '<', '>', '^', '(', ')'];
 
-/// One argument quoted for a Windows command line so the MSVC /
-/// `CommandLineToArgvW` rules read it back unchanged: inside quotes a `"` is
-/// written `\"`, and backslashes are doubled only right before a quote.
+/// One argument quoted for a Windows command line so the Rust std / MSVC
+/// (2008 and later) rules read it back unchanged: inside quotes a `"` is
+/// written `""`, which keeps the number of quotes even so cmd.exe's own
+/// quote state does not flip; backslashes are doubled only right before a
+/// quote.
 pub fn quote_arg(arg: &str) -> String {
     if !arg.is_empty() && !arg.contains(QUOTE_TRIGGERS) {
         return arg.to_string();
@@ -281,8 +293,8 @@ pub fn quote_arg(arg: &str) -> String {
         match c {
             '\\' => backslashes += 1,
             '"' => {
-                out.extend(std::iter::repeat('\\').take(2 * backslashes + 1));
-                out.push('"');
+                out.extend(std::iter::repeat('\\').take(2 * backslashes));
+                out.push_str("\"\"");
                 backslashes = 0;
             }
             _ => {
@@ -297,15 +309,12 @@ pub fn quote_arg(arg: &str) -> String {
     out
 }
 
-/// `program` and `args` as one line for cmd.exe or a `.cmd` file. The
-/// program is only wrapped in quotes: Windows reads the first argument up to
-/// the closing quote, without backslash escapes.
+/// `program` and `args` as one line for cmd.exe. The program is always
+/// wrapped in quotes, without escapes (Windows reads the first argument up
+/// to the closing quote): cmd also ends an unquoted command at `,` `;` `=`,
+/// which a path may hold, and a path never holds `"`.
 pub fn command_line(program: &str, args: &[String]) -> String {
-    let mut line = if program.contains(QUOTE_TRIGGERS) {
-        format!("\"{program}\"")
-    } else {
-        program.to_string()
-    };
+    let mut line = format!("\"{program}\"");
     for arg in args {
         line.push(' ');
         line.push_str(&quote_arg(arg));
@@ -466,6 +475,24 @@ mod tests {
         assert_eq!(written.last().unwrap(), "--y-stacks=1,1");
     }
 
+    /// An omitted --y-stacks inherits the previous group's raw list, which
+    /// can be longer than that group's series: the diff must follow it.
+    #[test]
+    fn inherited_stack_lists_longer_than_used_are_followed() {
+        // Group 1 uses one series of [1,2]; group 2 inherits all of it
+        round_trip("a.csv --y-cols=2 --y-stacks=1,2 -- --y-cols=2,3");
+
+        // Settings-window shape: one stack per column. File 2 matches file
+        // 1's list for its single series, file 3 must still write its own.
+        let (cli, mut groups) = parse(argv("a.csv --y-cols=2,3 -- b.csv --y-cols=4 -- c.csv --y-cols=5,6"));
+        groups[0].y_stacks = vec![1, 2];
+        groups[1].y_stacks = vec![1];
+        groups[2].y_stacks = vec![1, 1];
+        let written = to_argv(&cli, &groups).unwrap();
+        let (_, parsed) = parse(with_program(written.clone()));
+        assert_eq!(effective(&parsed), effective(&groups), "{written:?}");
+    }
+
     #[test]
     fn values_starting_with_a_hyphen_stay_values() {
         let written = round_trip("a.csv --y-cols=2 --y-names=-5V --x-proportion=-1 --x-unit=-");
@@ -519,20 +546,22 @@ mod tests {
         assert_eq!(quote_arg(""), "\"\"");
         assert_eq!(quote_arg("a b"), "\"a b\"");
         assert_eq!(quote_arg(r"C:\x y\"), r#""C:\x y\\""#);
-        assert_eq!(quote_arg(r#"a"b"#), r#""a\"b""#);
-        assert_eq!(quote_arg(r#"a\"b"#), r#""a\\\"b""#);
+        // A quote inside quotes is "": cmd.exe sees an even number of quotes
+        assert_eq!(quote_arg(r#"a"b"#), r#""a""b""#);
+        assert_eq!(quote_arg(r#"a\"b"#), r#""a\\""b""#);
         assert_eq!(quote_arg(r"a\b c"), r#""a\b c""#);
         assert_eq!(quote_arg("--y-names=Heater(%)"), "\"--y-names=Heater(%)\"");
         assert_eq!(quote_arg("x&y"), "\"x&y\"");
     }
 
     #[test]
-    fn command_line_quotes_the_program_without_escapes() {
+    fn command_line_always_quotes_the_program_without_escapes() {
         let args = strs(&["a b.csv", "--y-cols=2"]);
         assert_eq!(
             command_line(r"C:\Program Files\tail-f_plot.exe", &args),
             r#""C:\Program Files\tail-f_plot.exe" "a b.csv" --y-cols=2"#
         );
-        assert_eq!(command_line(r"C:\t\tail-f_plot.exe", &[]), r"C:\t\tail-f_plot.exe");
+        // cmd would end an unquoted command at , ; =
+        assert_eq!(command_line(r"D:\plot,v2\tail-f_plot.exe", &[]), r#""D:\plot,v2\tail-f_plot.exe""#);
     }
 }

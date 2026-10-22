@@ -102,10 +102,14 @@ dist/
 │   └── main.wxs             # WiX v7 MSI definition
 ├── src/
 │   ├── main.rs              # Entry point, CLI parsing, console handling
+│   ├── cmdline.rs           # argv <-> settings round trip, Windows quoting
+│   ├── groups.rs            # Per-file options (`--` file groups)
 │   ├── app.rs               # egui application logic
+│   ├── settings.rs          # Settings window (runtime options)
 │   ├── csv_watcher.rs       # File watching + CSV parsing
 │   ├── plot_state.rs        # Plot data management
 │   ├── toolbar.rs           # Toolbar UI
+│   ├── icons.rs             # Toolbar icons (painter-drawn)
 │   ├── tooltip.rs           # Tooltip rendering
 │   └── custom_legend.rs     # Legend rendering
 ├── hana.ico                 # Application icon

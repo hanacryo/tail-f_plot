@@ -16,6 +16,7 @@ Built with [egui](https://github.com/emilk/egui) and [egui_plot](https://github.
 - **Interactive zoom/pan**: Scroll-wheel zoom, drag pan, box zoom-in, click zoom-out.
 - **Auto-X / Auto-Y**: Each axis can follow the data on its own. With only one of them on, it fits just the lines drawn inside the other axis' current range — e.g. zoom Y to 3–5 K during a cool-down from 300 K, turn Auto-X on, and the time axis trims to where the trace is inside that band (still growing as new rows arrive) instead of spanning the empty hours above it. Hidden series (legend click) are ignored. When nothing is drawn in that range, the axis keeps its last range.
 - **Log scale**: Toggle Y-axis log scale at runtime.
+- **Settings window**: The gear button changes any option while the plot runs — file groups, columns picked from the header row, parsing, display and window placement — and copies the command line that starts the same view.
 - **Multi-monitor DPI aware**: Per-monitor DPI v2 support with work-area-percentage window placement.
 - **Zero config**: All settings via CLI arguments. No config files needed.
 
@@ -225,7 +226,7 @@ tail-f_plot.exe temp.csv --y-cols 5 --y-names Temp --y-stacks 1 --y-units K,A,V 
 |-------|--------|
 | Scroll wheel | Zoom in/out |
 | Drag | Pan (in default mode) |
-| Toolbar buttons | Home, Zoom In (box), Zoom Out (click), Auto X/Y, Log scale (the icon shows the current scale), Legend position. Hover a button for its tooltip |
+| Toolbar buttons | Home, Zoom In (box), Zoom Out (click), Auto X/Y, Log scale (the icon shows the current scale), Legend position, Settings (gear). Hover a button for its tooltip |
 
 ## Data Format
 
